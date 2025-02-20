@@ -306,14 +306,23 @@ def create_stock(request):
         }, status=status.HTTP_403_FORBIDDEN)
 
     try:
+        stock_name = request.data.get('stock_name')
+        if not stock_name:
+            return Response({
+                'success': False,
+                'data': {
+                    'error': 'Stock name is required'
+                }
+            }, status=status.HTTP_400_BAD_REQUEST)
+
         with transaction.atomic():
             # Create or get the company's wallet
             wallet, _ = Wallet.objects.get_or_create(user_id=request.user.id)
             
-            # Create the stock
+            # Create the stock using stock_name for both symbol and name
             stock = Stock.objects.create(
-                symbol=request.data.get('symbol', '').upper(),
-                name=request.data.get('stock_name', ''),
+                symbol=stock_name.upper(),  # Use stock_name as symbol, converted to uppercase
+                name=stock_name,
                 current_price=Decimal('0.00'),
                 total_shares=0,
                 shares_available=0,
