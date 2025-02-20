@@ -29,13 +29,19 @@ def validate_order_parameters(data, user):
             }
         })
     
-    # Validate order type
-    valid_order_types = ['MARKET', 'LIMIT']
-    if data['order_type'] not in valid_order_types:
+    # Validate order type based on buy/sell action
+    if data['is_buy'] and data['order_type'] != 'MARKET':
         raise ValidationError({
             'success': False,
             'data': {
-                'error': f'Invalid order type. Must be one of: {", ".join(valid_order_types)}'
+                'error': 'Buy orders must be MARKET orders'
+            }
+        })
+    if not data['is_buy'] and data['order_type'] != 'LIMIT':
+        raise ValidationError({
+            'success': False,
+            'data': {
+                'error': 'Sell orders must be LIMIT orders'
             }
         })
     
@@ -52,13 +58,13 @@ def validate_order_parameters(data, user):
             }
         })
     
-    # Validate price for LIMIT orders
-    if data['order_type'] == 'LIMIT':
+    # Validate price for LIMIT orders (all sell orders)
+    if not data['is_buy']:  # SELL
         if 'price' not in data:
             raise ValidationError({
                 'success': False,
                 'data': {
-                    'error': 'Price is required for LIMIT orders'
+                    'error': 'Price is required for sell orders'
                 }
             })
         try:
@@ -81,13 +87,15 @@ def validate_order_parameters(data, user):
     
     # Special handling for company accounts
     if user.account_type == 'company':
-        if not data['is_buy']:  # SELL
+        if not data['is_buy']:  # SELL (always LIMIT order)
             # Check if this is a stock created by this company
             if stock.company_id == user.id:
                 # Companies can sell their own created stock without restrictions
                 # The quantity they specify will become the new available shares
                 stock.shares_available = quantity
                 stock.total_shares = max(stock.total_shares, quantity)
+                # Set the limit price as the current price for company's own stock
+                stock.current_price = Decimal(str(data['price']))
                 stock.save()
             else:
                 # For stocks not created by this company, check available shares
@@ -98,9 +106,9 @@ def validate_order_parameters(data, user):
                             'error': 'Insufficient shares available'
                         }
                     })
-        else:  # BUY
-            # Check if company has sufficient funds
-            required_funds = quantity * (data.get('price', stock.current_price))
+        else:  # BUY (always MARKET order)
+            # Check if company has sufficient funds at current market price
+            required_funds = quantity * stock.current_price
             if wallet.balance < required_funds:
                 raise ValidationError({
                     'success': False,
@@ -109,8 +117,8 @@ def validate_order_parameters(data, user):
                     }
                 })
     else:  # Regular user account
-        if data['is_buy']:  # BUY
-            required_funds = quantity * (data.get('price', stock.current_price))
+        if data['is_buy']:  # BUY (always MARKET order)
+            required_funds = quantity * stock.current_price
             if wallet.balance < required_funds:
                 raise ValidationError({
                     'success': False,
@@ -118,7 +126,7 @@ def validate_order_parameters(data, user):
                         'error': 'Insufficient funds'
                     }
                 })
-        else:  # SELL
+        else:  # SELL (always LIMIT order)
             stock_holding = wallet.stockholding_set.filter(stock=stock).first()
             if not stock_holding or stock_holding.quantity < quantity:
                 raise ValidationError({
@@ -128,10 +136,14 @@ def validate_order_parameters(data, user):
                     }
                 })
     
+    # For buy orders, use current market price
+    # For sell orders, use the specified limit price
+    price = stock.current_price if data['is_buy'] else Decimal(str(data['price']))
+    
     return {
         'stock': stock,
         'wallet': wallet,
         'quantity': quantity,
         'order_type': order_type,
-        'price': Decimal(str(data.get('price', stock.current_price)))
+        'price': price
     } 
