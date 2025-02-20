@@ -1,33 +1,35 @@
 from rest_framework import serializers
 from .models import Wallet, Stock, StockHolding, Order, Transaction
 
-class WalletSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Wallet
-        fields = ['id', 'user_id', 'balance', 'created_at', 'updated_at']
-        read_only_fields = ['created_at', 'updated_at']
-
 class StockSerializer(serializers.ModelSerializer):
     class Meta:
         model = Stock
-        fields = ['id', 'symbol', 'name', 'current_price', 'last_updated']
-        read_only_fields = ['last_updated']
+        fields = ['id', 'symbol', 'name', 'current_price', 'total_shares', 'shares_available', 'created_at', 'last_updated']
+        read_only_fields = ['created_at', 'last_updated']
 
 class StockHoldingSerializer(serializers.ModelSerializer):
-    stock_symbol = serializers.CharField(source='stock.symbol', read_only=True)
+    stock_name = serializers.CharField(source='stock.name', read_only=True)
     
     class Meta:
         model = StockHolding
-        fields = ['id', 'wallet', 'stock', 'stock_symbol', 'quantity', 'average_price', 'updated_at']
+        fields = ['id', 'stock_id', 'stock_name', 'quantity', 'average_price', 'updated_at']
         read_only_fields = ['updated_at']
 
+class WalletSerializer(serializers.ModelSerializer):
+    holdings = StockHoldingSerializer(many=True, read_only=True)
+    
+    class Meta:
+        model = Wallet
+        fields = ['id', 'user_id', 'balance', 'holdings', 'created_at', 'updated_at']
+        read_only_fields = ['created_at', 'updated_at']
+
 class OrderSerializer(serializers.ModelSerializer):
-    stock_symbol = serializers.CharField(source='stock.symbol', read_only=True)
+    stock_name = serializers.CharField(source='stock.name', read_only=True)
     
     class Meta:
         model = Order
         fields = [
-            'id', 'wallet', 'stock', 'stock_symbol', 'order_type',
+            'id', 'stock_id', 'stock_name', 'order_type',
             'quantity', 'price', 'status', 'created_at', 'updated_at'
         ]
         read_only_fields = ['status', 'created_at', 'updated_at']
@@ -44,12 +46,12 @@ class OrderSerializer(serializers.ModelSerializer):
 
 class TransactionSerializer(serializers.ModelSerializer):
     order_type = serializers.CharField(source='order.order_type', read_only=True)
-    stock_symbol = serializers.CharField(source='order.stock.symbol', read_only=True)
+    stock_name = serializers.CharField(source='order.stock.name', read_only=True)
     
     class Meta:
         model = Transaction
         fields = [
-            'id', 'order', 'order_type', 'stock_symbol',
+            'id', 'order_id', 'order_type', 'stock_name',
             'executed_price', 'executed_quantity',
             'transaction_fee', 'executed_at'
         ]

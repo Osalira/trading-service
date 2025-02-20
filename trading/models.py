@@ -27,6 +27,10 @@ class Stock(models.Model):
     name = models.CharField(max_length=100)
     current_price = models.DecimalField(max_digits=10, decimal_places=2)
     last_updated = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    total_shares = models.IntegerField(default=0)
+    shares_available = models.IntegerField(default=0)
+    company_id = models.IntegerField(null=True, blank=True)  # References the company that created this stock
 
     def __str__(self):
         return f"{self.symbol} - {self.name}"
@@ -40,9 +44,11 @@ class StockHolding(models.Model):
     quantity = models.IntegerField(default=0, validators=[MinValueValidator(0)])
     average_price = models.DecimalField(max_digits=10, decimal_places=2)
     updated_at = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         unique_together = ('wallet', 'stock')
+        ordering = ['-stock__name']  # Sort by stock name in lexicographically decreasing order
 
     def __str__(self):
         return f"{self.wallet.user_id} - {self.stock.symbol}: {self.quantity}"
@@ -57,6 +63,7 @@ class Order(models.Model):
 
     class OrderStatus(models.TextChoices):
         PENDING = 'PENDING', 'Pending'
+        PARTIALLY_COMPLETE = 'PARTIALLY_COMPLETE', 'Partially Complete'
         COMPLETED = 'COMPLETED', 'Completed'
         CANCELLED = 'CANCELLED', 'Cancelled'
         FAILED = 'FAILED', 'Failed'
@@ -67,7 +74,7 @@ class Order(models.Model):
     quantity = models.IntegerField(validators=[MinValueValidator(1)])
     price = models.DecimalField(max_digits=10, decimal_places=2)
     status = models.CharField(
-        max_length=10,
+        max_length=20,
         choices=OrderStatus.choices,
         default=OrderStatus.PENDING
     )
