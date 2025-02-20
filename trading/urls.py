@@ -6,12 +6,14 @@ from . import views
 router = DefaultRouter()
 router.register(r'wallets', views.WalletViewSet, basename='wallet')
 router.register(r'stocks', views.StockViewSet, basename='stock')
+router.register(r'orders', views.OrderViewSet, basename='order')
 
 # URL patterns for the trading app
 urlpatterns = [
     # Custom endpoints
     path('stocks/create/', views.create_stock, name='create_stock'),
     path('orders/place/', views.place_order, name='place-order'),
+    path('orders/list/', views.get_orders, name='get-orders'),
     path('portfolio/', views.get_portfolio, name='get-portfolio'),
     path('stocks/company/', views.get_company_stocks, name='get_company_stocks'),
     path('stocks/add-to-user/', views.add_stock_to_user, name='add_stock_to_user'),

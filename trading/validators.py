@@ -1,6 +1,6 @@
 from decimal import Decimal
 from rest_framework.exceptions import ValidationError
-from .models import Stock, Wallet, Order
+from .models import Stock, Wallet, Order, StockHolding
 
 def validate_order_parameters(data, user):
     """
@@ -97,53 +97,56 @@ def validate_order_parameters(data, user):
                 # Set the limit price as the current price for company's own stock
                 stock.current_price = Decimal(str(data['price']))
                 stock.save()
+                
+                # Update the company's holding
+                holding, _ = StockHolding.objects.get_or_create(
+                    wallet=wallet,
+                    stock=stock,
+                    defaults={
+                        'quantity': quantity,
+                        'average_price': Decimal(str(data['price']))
+                    }
+                )
+                holding.quantity = quantity
+                holding.average_price = Decimal(str(data['price']))
+                holding.save()
             else:
-                # For stocks not created by this company, check available shares
-                if stock.shares_available < quantity:
+                # Companies can sell other stocks only if they have sufficient holdings
+                holding = StockHolding.objects.filter(wallet=wallet, stock=stock).first()
+                if not holding or holding.quantity < quantity:
                     raise ValidationError({
                         'success': False,
                         'data': {
-                            'error': 'Insufficient shares available'
+                            'error': 'Insufficient stock holdings for sell order'
                         }
                     })
-        else:  # BUY (always MARKET order)
-            # Check if company has sufficient funds at current market price
-            required_funds = quantity * stock.current_price
-            if wallet.balance < required_funds:
+    else:
+        # Regular user validation
+        if data['is_buy']:  # BUY
+            # Check if user has sufficient balance
+            required_amount = Decimal(str(quantity)) * stock.current_price
+            if wallet.balance < required_amount:
                 raise ValidationError({
                     'success': False,
                     'data': {
-                        'error': 'Insufficient funds'
+                        'error': 'Insufficient balance for buy order'
                     }
                 })
-    else:  # Regular user account
-        if data['is_buy']:  # BUY (always MARKET order)
-            required_funds = quantity * stock.current_price
-            if wallet.balance < required_funds:
+        else:  # SELL
+            # Check if user has sufficient holdings
+            holding = StockHolding.objects.filter(wallet=wallet, stock=stock).first()
+            if not holding or holding.quantity < quantity:
                 raise ValidationError({
                     'success': False,
                     'data': {
-                        'error': 'Insufficient funds'
+                        'error': 'Insufficient stock holdings for sell order'
                     }
                 })
-        else:  # SELL (always LIMIT order)
-            stock_holding = wallet.stockholding_set.filter(stock=stock).first()
-            if not stock_holding or stock_holding.quantity < quantity:
-                raise ValidationError({
-                    'success': False,
-                    'data': {
-                        'error': 'Insufficient stock quantity'
-                    }
-                })
-    
-    # For buy orders, use current market price
-    # For sell orders, use the specified limit price
-    price = stock.current_price if data['is_buy'] else Decimal(str(data['price']))
     
     return {
-        'stock': stock,
         'wallet': wallet,
+        'stock': stock,
         'quantity': quantity,
         'order_type': order_type,
-        'price': price
+        'price': Decimal(str(data.get('price', stock.current_price)))
     } 

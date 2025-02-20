@@ -37,6 +37,21 @@ class StockViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = StockSerializer
     permission_classes = [IsAuthenticated]
 
+class OrderViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for managing orders
+    """
+    serializer_class = OrderSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        """
+        Get orders for the authenticated user
+        """
+        user_id = self.request.user.id
+        wallet = Wallet.objects.get_or_create(user_id=user_id)[0]
+        return Order.objects.filter(wallet=wallet).order_by('-created_at')
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def place_order(request):
@@ -44,27 +59,64 @@ def place_order(request):
     try:
         validated_data = validate_order_parameters(request.data, request.user)
         
-        order = Order.objects.create(
-            wallet=validated_data['wallet'],
-            stock=validated_data['stock'],
-            quantity=validated_data['quantity'],
-            order_type=validated_data['order_type'],
-            price=validated_data['price'],
-            status='PENDING'
-        )
-        
-        # Process order immediately for market orders
-        if validated_data['order_type'] == 'MARKET':
-            process_market_order(order)
-        
-        return Response({
-            'success': True,
-            'data': {
-                'order_id': order.id,
-                'status': order.status
-            }
-        })
-        
+        with transaction.atomic():
+            order = Order.objects.create(
+                wallet=validated_data['wallet'],
+                stock=validated_data['stock'],
+                quantity=validated_data['quantity'],
+                order_type=validated_data['order_type'],
+                price=validated_data['price'],
+                status='PENDING'
+            )
+            
+            # For company sell orders of their own stock, process immediately
+            if (request.user.account_type == 'company' and 
+                validated_data['order_type'] == 'SELL' and 
+                validated_data['stock'].company_id == request.user.id):
+                
+                # Update stock price and available shares
+                stock = validated_data['stock']
+                stock.current_price = validated_data['price']
+                stock.shares_available = validated_data['quantity']
+                stock.total_shares = max(stock.total_shares, validated_data['quantity'])
+                stock.save()
+                
+                # Update or create holding
+                holding, _ = StockHolding.objects.get_or_create(
+                    wallet=validated_data['wallet'],
+                    stock=stock,
+                    defaults={
+                        'quantity': validated_data['quantity'],
+                        'average_price': validated_data['price']
+                    }
+                )
+                holding.quantity = validated_data['quantity']
+                holding.average_price = validated_data['price']
+                holding.save()
+                
+                # Create transaction record
+                Transaction.objects.create(
+                    order=order,
+                    executed_price=validated_data['price'],
+                    executed_quantity=validated_data['quantity'],
+                    transaction_fee=Decimal('0.00')  # No fee for company orders
+                )
+                
+                order.status = 'COMPLETED'
+                order.save()
+            
+            # For market buy orders, process immediately
+            elif validated_data['order_type'] == 'BUY':
+                process_market_order(order)
+            
+            return Response({
+                'success': True,
+                'data': {
+                    'order_id': order.id,
+                    'status': order.status
+                }
+            })
+            
     except ValidationError as e:
         logger.warning(f"Order validation failed: {str(e)}")
         return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
@@ -81,40 +133,71 @@ def place_order(request):
 def process_market_order(order):
     """Process a market order immediately"""
     try:
-        if order.order_action == 'BUY':
-            # Update wallet balance
-            order.wallet.balance -= (order.quantity * order.stock.current_price)
-            order.wallet.save()
+        with transaction.atomic():
+            if order.order_type == 'BUY':
+                # Calculate total cost
+                total_cost = order.quantity * order.stock.current_price
+                
+                # Update wallet balance
+                order.wallet.balance -= total_cost
+                order.wallet.save()
+                
+                # Update or create stock holding
+                holding, created = StockHolding.objects.get_or_create(
+                    wallet=order.wallet,
+                    stock=order.stock,
+                    defaults={
+                        'quantity': 0,
+                        'average_price': order.stock.current_price
+                    }
+                )
+                
+                if not created:
+                    # Calculate new average price
+                    total_value = (holding.quantity * holding.average_price) + total_cost
+                    total_quantity = holding.quantity + order.quantity
+                    holding.average_price = total_value / total_quantity
+                
+                holding.quantity += order.quantity
+                holding.save()
+                
+                # Update stock available shares
+                order.stock.shares_available -= order.quantity
+                order.stock.save()
+                
+            else:  # SELL
+                # Update stock holding
+                holding = StockHolding.objects.get(
+                    wallet=order.wallet,
+                    stock=order.stock
+                )
+                holding.quantity -= order.quantity
+                
+                if holding.quantity > 0:
+                    holding.save()
+                else:
+                    holding.delete()
+                
+                # Update wallet balance
+                total_value = order.quantity * order.stock.current_price
+                order.wallet.balance += total_value
+                order.wallet.save()
+                
+                # Update stock available shares
+                order.stock.shares_available += order.quantity
+                order.stock.save()
             
-            # Update or create stock holding
-            holding, created = StockHolding.objects.get_or_create(
-                wallet=order.wallet,
-                stock=order.stock,
-                defaults={'quantity': 0}
+            # Create transaction record
+            Transaction.objects.create(
+                order=order,
+                executed_price=order.stock.current_price,
+                executed_quantity=order.quantity,
+                transaction_fee=Decimal('0.00')  # Add fee calculation if needed
             )
-            holding.quantity += order.quantity
-            holding.save()
             
-        else:  # SELL
-            # Update stock holding
-            holding = StockHolding.objects.get(
-                wallet=order.wallet,
-                stock=order.stock
-            )
-            holding.quantity -= order.quantity
-            holding.save()
+            order.status = 'COMPLETED'
+            order.save()
             
-            if holding.quantity == 0:
-                holding.delete()
-            
-            # Update wallet balance
-            order.wallet.balance += (order.quantity * order.stock.current_price)
-            order.wallet.save()
-        
-        order.status = 'COMPLETED'
-        order.completed_at = timezone.now()
-        order.save()
-        
     except Exception as e:
         logger.error(f"Error processing market order {order.id}: {str(e)}")
         order.status = 'FAILED'
@@ -125,28 +208,82 @@ def process_market_order(order):
 @permission_classes([IsAuthenticated])
 def get_portfolio(request):
     """Get user's portfolio"""
+    logger.info("=== Starting get_portfolio endpoint ===")
+    logger.debug(f"User ID: {request.user.id}, Account Type: {request.user.account_type}")
+    
     try:
-        user_id = request.user.user_id
-        wallet = get_object_or_404(Wallet, user_id=user_id)
-        holdings = StockHolding.objects.filter(wallet=wallet).order_by('-stock__name')
+        user_id = request.user.id
+        wallet = Wallet.objects.get_or_create(user_id=user_id)[0]
+        logger.debug(f"Found wallet with balance: {wallet.balance}")
         
-        serialized_holdings = StockHoldingSerializer(holdings, many=True).data
+        # Get regular holdings
+        holdings = StockHolding.objects.filter(wallet=wallet).select_related('stock')
+        logger.debug(f"Found {holdings.count()} holdings")
         
-        return Response({
+        # For company accounts, also include their created stocks
+        total_value = Decimal('0.00')
+        portfolio_data = []
+        
+        # Add regular holdings
+        for holding in holdings:
+            value = Decimal(str(holding.quantity)) * holding.stock.current_price
+            total_value += value
+            holding_data = {
+                'symbol': holding.stock.symbol,
+                'quantity': holding.quantity,
+                'average_price': float(holding.average_price),
+                'current_price': float(holding.stock.current_price),
+                'profit_loss': float(value - (holding.average_price * holding.quantity))
+            }
+            portfolio_data.append(holding_data)
+            logger.debug(f"Added holding: {holding_data}")
+        
+        # For company accounts, add their created stocks
+        if request.user.account_type == 'company':
+            company_stocks = Stock.objects.filter(company_id=user_id)
+            logger.debug(f"Found {company_stocks.count()} company stocks")
+            for stock in company_stocks:
+                value = Decimal(str(stock.shares_available)) * stock.current_price
+                total_value += value
+                stock_data = {
+                    'symbol': stock.symbol,
+                    'quantity': stock.shares_available,
+                    'average_price': float(stock.current_price),
+                    'current_price': float(stock.current_price),
+                    'profit_loss': 0.0  # No profit/loss for company's own stock
+                }
+                portfolio_data.append(stock_data)
+                logger.debug(f"Added company stock: {stock_data}")
+        
+        # Get active orders count
+        active_orders = Order.objects.filter(
+            wallet=wallet,
+            status__in=['PENDING', 'PARTIALLY_COMPLETE']
+        ).count()
+        logger.debug(f"Active orders count: {active_orders}")
+        
+        response_data = {
             'success': True,
             'data': {
-                'holdings': serialized_holdings,
-                'total_value': sum(h.quantity * h.stock.current_price for h in holdings)
+                'holdings': portfolio_data,
+                'total_value': float(total_value),
+                'active_orders': active_orders
             }
-        })
+        }
+        logger.info("Successfully retrieved portfolio data")
+        logger.debug(f"Response data: {response_data}")
+        return Response(response_data)
+        
     except Exception as e:
-        logger.error(f"Error getting portfolio: {str(e)}")
+        logger.error(f"Error getting portfolio: {str(e)}", exc_info=True)
         return Response({
             'success': False,
             'data': {
                 'error': str(e)
             }
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    finally:
+        logger.info("=== Ending get_portfolio endpoint ===")
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -156,69 +293,52 @@ def create_stock(request):
     Only company accounts can create stocks.
     """
     logger.info("=== Starting create_stock endpoint ===")
-    logger.debug(f"Request method: {request.method}")
-    logger.debug(f"Request path: {request.path}")
-    logger.debug(f"Request content type: {request.content_type}")
-    logger.debug(f"Request headers: {dict(request.headers)}")
     logger.debug(f"Request data: {request.data}")
     logger.debug(f"User info - ID: {request.user.id}, Type: {request.user.account_type}")
     
-    if request.method != 'POST':
-        logger.warning(f"Method {request.method} not allowed")
+    if request.user.account_type != 'company':
+        logger.warning(f"Unauthorized attempt to create stock by non-company account. Account type: {request.user.account_type}")
         return Response({
             'success': False,
             'data': {
-                'error': f'Method {request.method} not allowed'
+                'error': 'Only company accounts can create stocks'
             }
-        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
-    
+        }, status=status.HTTP_403_FORBIDDEN)
+
     try:
-        # Verify company account
-        if request.user.account_type != 'company':
-            logger.warning(f"Unauthorized attempt to create stock by non-company account. Account type: {request.user.account_type}")
+        with transaction.atomic():
+            # Create or get the company's wallet
+            wallet, _ = Wallet.objects.get_or_create(user_id=request.user.id)
+            
+            # Create the stock
+            stock = Stock.objects.create(
+                symbol=request.data.get('symbol', '').upper(),
+                name=request.data.get('stock_name', ''),
+                current_price=Decimal('0.00'),
+                total_shares=0,
+                shares_available=0,
+                company_id=request.user.id
+            )
+            
+            # Create initial holding for the company
+            StockHolding.objects.create(
+                wallet=wallet,
+                stock=stock,
+                quantity=0,
+                average_price=Decimal('0.00')
+            )
+            
             return Response({
-                'success': False,
+                'success': True,
                 'data': {
-                    'error': 'Only company accounts can create stocks'
+                    'stock_id': stock.id,
+                    'symbol': stock.symbol,
+                    'name': stock.name
                 }
-            }, status=status.HTTP_403_FORBIDDEN)
-
-        # Validate request data
-        if 'stock_name' not in request.data:
-            logger.warning("Missing stock_name in request data")
-            return Response({
-                'success': False,
-                'data': {
-                    'error': 'stock_name is required'
-                }
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        stock_name = request.data['stock_name']
-        logger.info(f"Creating stock with name: {stock_name}")
-
-        # Create stock with zero shares and price
-        stock = Stock.objects.create(
-            name=stock_name,
-            symbol=stock_name.upper(),
-            current_price=Decimal('0.00'),
-            total_shares=0,
-            shares_available=0,
-            company_id=request.user.id
-        )
-        
-        logger.info(f"Stock created successfully. ID: {stock.id}, Symbol: {stock.symbol}")
-        
-        return Response({
-            'success': True,
-            'data': {
-                'message': 'Stock created successfully',
-                'stock_id': stock.id,
-                'symbol': stock.symbol
-            }
-        }, status=status.HTTP_201_CREATED)
-        
+            })
+            
     except Exception as e:
-        logger.error(f"Unexpected error creating stock: {str(e)}", exc_info=True)
+        logger.error(f"Error creating stock: {str(e)}", exc_info=True)
         return Response({
             'success': False,
             'data': {
@@ -570,4 +690,59 @@ def get_company_stocks(request):
             'data': {
                 'error': 'Failed to fetch company stocks'
             }
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR) 
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_orders(request):
+    """
+    Get all orders for the authenticated user
+    """
+    logger.info("=== Starting get_orders endpoint ===")
+    logger.debug(f"User ID: {request.user.id}, Account Type: {request.user.account_type}")
+    
+    try:
+        user_id = request.user.id
+        wallet = Wallet.objects.get_or_create(user_id=user_id)[0]
+        logger.debug(f"Found wallet: {wallet.id}")
+        
+        # Get orders with related stock information
+        orders = Order.objects.filter(wallet=wallet)\
+            .select_related('stock')\
+            .order_by('-created_at')
+        
+        logger.debug(f"Found {orders.count()} orders")
+        
+        # Prepare order data with stock information
+        orders_data = []
+        for order in orders:
+            order_data = {
+                'id': order.id,
+                'symbol': order.stock.symbol,
+                'type': order.order_type,
+                'quantity': order.quantity,
+                'price': float(order.price),
+                'status': order.status,
+                'created_at': order.created_at.isoformat()
+            }
+            orders_data.append(order_data)
+            logger.debug(f"Added order: {order_data}")
+        
+        response_data = {
+            'success': True,
+            'data': orders_data
+        }
+        logger.info("Successfully retrieved orders")
+        logger.debug(f"Response data: {response_data}")
+        return Response(response_data)
+        
+    except Exception as e:
+        logger.error(f"Error getting orders: {str(e)}", exc_info=True)
+        return Response({
+            'success': False,
+            'data': {
+                'error': str(e)
+            }
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    finally:
+        logger.info("=== Ending get_orders endpoint ===") 
