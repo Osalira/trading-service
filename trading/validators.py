@@ -71,19 +71,20 @@ def validate_order_parameters(data, user):
                 }
             })
         
-        # Check if user owns the stock
+        # Check if user owns the stock or is the company that created it
+        is_company_stock = user.account_type == 'company' and stock.company_id == user.id
         holding = StockHolding.objects.filter(
             wallet=wallet,
             stock=stock,
             quantity__gt=0  # Ensure they have a positive quantity
         ).first()
         
-        if not holding:
+        if not holding and not is_company_stock:
             raise ValidationError({
                 'stock_id': 'You can only sell stocks you own'
             })
         
-        if holding.quantity < quantity:
+        if holding and holding.quantity < quantity and not is_company_stock:
             raise ValidationError({
                 'stock_id': f'Insufficient shares. You own {holding.quantity} shares but trying to sell {quantity}'
             })
