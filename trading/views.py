@@ -9,6 +9,7 @@ import jwt
 import logging
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
+from django.db.models import F
 
 from .models import Wallet, Stock, StockHolding, Order, Transaction
 from .serializers import (
@@ -55,58 +56,28 @@ class OrderViewSet(viewsets.ModelViewSet):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def place_order(request):
-    """Place a new stock order"""
+    """Place a new order"""
+    logger.info("=== Starting place_order endpoint ===")
+    logger.debug(f"Request data: {request.data}")
+    
     try:
-        validated_data = validate_order_parameters(request.data, request.user)
-        
         with transaction.atomic():
+            # Validate order parameters
+            validated_data = validate_order_parameters(request.data, request.user)
+            
+            # Create order
             order = Order.objects.create(
                 wallet=validated_data['wallet'],
                 stock=validated_data['stock'],
-                quantity=validated_data['quantity'],
                 order_type=validated_data['order_type'],
+                quantity=validated_data['quantity'],
+                original_quantity=validated_data['quantity'],  # Set original quantity
                 price=validated_data['price'],
                 status='PENDING'
             )
             
-            # For company sell orders of their own stock, process immediately
-            if (request.user.account_type == 'company' and 
-                validated_data['order_type'] == 'SELL' and 
-                validated_data['stock'].company_id == request.user.id):
-                
-                # Update stock price and available shares
-                stock = validated_data['stock']
-                stock.current_price = validated_data['price']
-                stock.shares_available = validated_data['quantity']
-                stock.total_shares = max(stock.total_shares, validated_data['quantity'])
-                stock.save()
-                
-                # Update or create holding
-                holding, _ = StockHolding.objects.get_or_create(
-                    wallet=validated_data['wallet'],
-                    stock=stock,
-                    defaults={
-                        'quantity': validated_data['quantity'],
-                        'average_price': validated_data['price']
-                    }
-                )
-                holding.quantity = validated_data['quantity']
-                holding.average_price = validated_data['price']
-                holding.save()
-                
-                # Create transaction record
-                Transaction.objects.create(
-                    order=order,
-                    executed_price=validated_data['price'],
-                    executed_quantity=validated_data['quantity'],
-                    transaction_fee=Decimal('0.00')  # No fee for company orders
-                )
-                
-                order.status = 'COMPLETED'
-                order.save()
-            
-            # For market buy orders, process immediately
-            elif validated_data['order_type'] == 'BUY':
+            # For market orders (buy orders), process immediately
+            if validated_data['order_type'] == 'BUY':
                 process_market_order(order)
             
             return Response({
@@ -129,77 +100,107 @@ def place_order(request):
                 'error': str(e)
             }
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    finally:
+        logger.info("=== Ending place_order endpoint ===")
 
 def process_market_order(order):
-    """Process a market order immediately"""
+    """Process a market order and update relevant records"""
     try:
         with transaction.atomic():
+            # Get the stock
+            stock = Stock.objects.get(id=order.stock.id)
+            
+            # Get or create wallet
+            wallet = Wallet.objects.get(user_id=order.wallet.user_id)
+            
             if order.order_type == 'BUY':
-                # Calculate total cost
-                total_cost = order.quantity * order.stock.current_price
+                # Calculate total cost for executed portion
+                total_cost = Decimal(str(order.quantity)) * stock.current_price
                 
                 # Update wallet balance
-                order.wallet.balance -= total_cost
-                order.wallet.save()
+                if wallet.balance < total_cost:
+                    raise ValidationError('Insufficient funds')
+                wallet.balance -= total_cost
+                wallet.save()
                 
-                # Update or create stock holding
-                holding, created = StockHolding.objects.get_or_create(
-                    wallet=order.wallet,
-                    stock=order.stock,
-                    defaults={
-                        'quantity': 0,
-                        'average_price': order.stock.current_price
-                    }
-                )
+                # Get or create stock holding
+                holding = StockHolding.objects.filter(
+                    wallet=wallet,
+                    stock=stock
+                ).first()
                 
-                if not created:
-                    # Calculate new average price
-                    total_value = (holding.quantity * holding.average_price) + total_cost
-                    total_quantity = holding.quantity + order.quantity
-                    holding.average_price = total_value / total_quantity
-                
-                holding.quantity += order.quantity
-                holding.save()
-                
-                # Update stock available shares
-                order.stock.shares_available -= order.quantity
-                order.stock.save()
-                
-            else:  # SELL
-                # Update stock holding
-                holding = StockHolding.objects.get(
-                    wallet=order.wallet,
-                    stock=order.stock
-                )
-                holding.quantity -= order.quantity
-                
-                if holding.quantity > 0:
+                if holding:
+                    # Update existing holding with new average price
+                    total_value = (holding.quantity * holding.average_price) + (order.quantity * stock.current_price)
+                    new_quantity = holding.quantity + order.quantity
+                    holding.average_price = total_value / new_quantity
+                    holding.quantity = new_quantity
                     holding.save()
                 else:
-                    holding.delete()
+                    # Create new holding
+                    StockHolding.objects.create(
+                        wallet=wallet,
+                        stock=stock,
+                        quantity=order.quantity,
+                        average_price=stock.current_price
+                    )
+                
+                # Update stock's available shares
+                stock.shares_available = F('shares_available') - order.quantity
+                stock.save()
+                
+                # Update order status
+                order.status = 'COMPLETED'
+                order.save()
+                
+            else:  # SELL order
+                # Get existing holding
+                holding = StockHolding.objects.filter(
+                    wallet=wallet,
+                    stock=stock
+                ).first()
+                
+                if not holding or holding.quantity < order.quantity:
+                    raise ValidationError('Insufficient shares for sale')
+                
+                # Calculate sale proceeds
+                sale_proceeds = Decimal(str(order.quantity)) * stock.current_price
                 
                 # Update wallet balance
-                total_value = order.quantity * order.stock.current_price
-                order.wallet.balance += total_value
-                order.wallet.save()
+                wallet.balance += sale_proceeds
+                wallet.save()
                 
-                # Update stock available shares
-                order.stock.shares_available += order.quantity
-                order.stock.save()
+                # Update holding
+                holding.quantity -= order.quantity
+                if holding.quantity == 0:
+                    holding.delete()
+                else:
+                    holding.save()
+                
+                # Update stock's available shares
+                stock.shares_available = F('shares_available') + order.quantity
+                stock.save()
+                
+                # Check if this is a partial fill
+                if order.quantity < order.original_quantity:
+                    order.status = 'PARTIALLY_COMPLETE'
+                    order.quantity = order.original_quantity - order.quantity  # Update remaining quantity
+                else:
+                    order.status = 'COMPLETED'
+                order.save()
             
             # Create transaction record
             Transaction.objects.create(
                 order=order,
-                executed_price=order.stock.current_price,
+                executed_price=stock.current_price,
                 executed_quantity=order.quantity,
-                transaction_fee=Decimal('0.00')  # Add fee calculation if needed
+                transaction_fee=Decimal('0.00')  # Can be calculated based on business rules
             )
             
-            order.status = 'COMPLETED'
-            order.save()
+            return order
             
     except Exception as e:
-        logger.error(f"Error processing market order {order.id}: {str(e)}")
+        logger.error(f"Error processing market order: {str(e)}")
         order.status = 'FAILED'
         order.save()
         raise

@@ -57,32 +57,40 @@ class Order(models.Model):
     """
     Represents a trading order (buy or sell)
     """
-    class OrderType(models.TextChoices):
-        BUY = 'BUY', 'Buy'
-        SELL = 'SELL', 'Sell'
-
-    class OrderStatus(models.TextChoices):
-        PENDING = 'PENDING', 'Pending'
-        PARTIALLY_COMPLETE = 'PARTIALLY_COMPLETE', 'Partially Complete'
-        COMPLETED = 'COMPLETED', 'Completed'
-        CANCELLED = 'CANCELLED', 'Cancelled'
-        FAILED = 'FAILED', 'Failed'
-
+    ORDER_TYPES = (
+        ('BUY', 'Buy'),
+        ('SELL', 'Sell'),
+    )
+    ORDER_STATUS = (
+        ('PENDING', 'Pending'),
+        ('IN_PROGRESS', 'In Progress'),
+        ('PARTIALLY_COMPLETE', 'Partially Complete'),
+        ('COMPLETED', 'Completed'),
+        ('CANCELLED', 'Cancelled'),
+        ('FAILED', 'Failed'),
+    )
+    
     wallet = models.ForeignKey(Wallet, on_delete=models.CASCADE, related_name='orders')
     stock = models.ForeignKey(Stock, on_delete=models.CASCADE)
-    order_type = models.CharField(max_length=4, choices=OrderType.choices)
-    quantity = models.IntegerField(validators=[MinValueValidator(1)])
+    parent_order = models.ForeignKey('self', on_delete=models.CASCADE, null=True, blank=True, related_name='child_orders')
+    order_type = models.CharField(max_length=4, choices=ORDER_TYPES)
+    quantity = models.IntegerField()
+    original_quantity = models.IntegerField(default=0)  # Default value added
     price = models.DecimalField(max_digits=10, decimal_places=2)
-    status = models.CharField(
-        max_length=20,
-        choices=OrderStatus.choices,
-        default=OrderStatus.PENDING
-    )
+    status = models.CharField(max_length=20, choices=ORDER_STATUS, default='PENDING')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    def save(self, *args, **kwargs):
+        if not self.pk:  # Only set original_quantity on creation
+            self.original_quantity = self.quantity
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.order_type} {self.quantity} {self.stock.symbol} @ {self.price}"
+
+    class Meta:
+        ordering = ['-created_at']
 
 class Transaction(models.Model):
     """
