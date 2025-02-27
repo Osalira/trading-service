@@ -9,13 +9,14 @@ ENV DJANGO_SETTINGS_MODULE=trading_service_project.settings
 # Set work directory
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies (added curl here)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         postgresql-client \
         build-essential \
         libpq-dev \
         netcat-openbsd \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
@@ -42,4 +43,4 @@ RUN chmod +x /app/docker-entrypoint.sh
 EXPOSE 8000
 
 # Use the entrypoint script
-ENTRYPOINT ["/app/docker-entrypoint.sh"] 
+ENTRYPOINT ["/app/docker-entrypoint.sh"]

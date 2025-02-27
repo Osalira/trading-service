@@ -619,13 +619,19 @@ def add_money_to_wallet(request):
             }, status=status.HTTP_400_BAD_REQUEST)
         
         wallet, created = Wallet.objects.get_or_create(user_id=user_id)
-        wallet.balance += amount
+        # Ensure both values are Decimal type before addition
+        wallet.balance = Decimal(wallet.balance) + amount
         wallet.save()
         
+        # Convert to float first, then to int if it's a whole number
+        balance = float(wallet.balance)
+        if balance == int(balance):
+            balance = int(balance)
+            
         return Response({
             'success': True,
             'data': {
-                'balance': float(wallet.balance)
+                'balance': balance
             }
         })
     except Exception as e:
@@ -646,10 +652,15 @@ def get_wallet_balance(request):
     try:
         wallet, created = Wallet.objects.get_or_create(user_id=request.user.id)
         
+        # Convert to float first, then to int if it's a whole number
+        balance = float(wallet.balance)
+        if balance == int(balance):
+            balance = int(balance)
+        
         return Response({
             'success': True,
             'data': {
-                'balance': float(wallet.balance)
+                'balance': balance
             }
         })
         
@@ -755,4 +766,36 @@ def get_orders(request):
             }
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     finally:
-        logger.info("=== Ending get_orders endpoint ===") 
+        logger.info("=== Ending get_orders endpoint ===")
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_wallet_transactions(request):
+    """
+    Get the transaction history for a user's wallet.
+    """
+    try:
+        user_id = request.user.id
+        wallet = get_object_or_404(Wallet, user_id=user_id)
+        
+        # Get all transactions related to the wallet
+        # For the purposes of this implementation, we'll return the orders as transactions
+        orders = Order.objects.filter(wallet=wallet).order_by('-created_at')
+        
+        # Serialize the orders
+        serializer = OrderSerializer(orders, many=True)
+        
+        return Response({
+            'success': True,
+            'data': {
+                'transactions': serializer.data
+            }
+        }, status=status.HTTP_200_OK)
+        
+    except Exception as e:
+        return Response({
+            'success': False,
+            'data': {
+                'error': str(e)
+            }
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR) 

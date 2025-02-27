@@ -23,6 +23,7 @@ urlpatterns = [
     path('stocks/prices/', views.get_stock_prices, name='get_stock_prices'),
     path('wallet/add-money/', views.add_money_to_wallet, name='add_money_to_wallet'),
     path('wallet/balance/', views.get_wallet_balance, name='get_wallet_balance'),
+    path('wallet/transactions/', views.get_wallet_transactions, name='get_wallet_transactions'),
     
     # Include router URLs last
     path('', include(router.urls)),
