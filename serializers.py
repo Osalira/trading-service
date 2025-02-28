@@ -92,9 +92,11 @@ class StockPriceSerializer(serializers.ModelSerializer):
         fields = ['id', 'symbol', 'company_name', 'current_price', 'updated_at']
 
 class PortfolioResponseSerializer(serializers.ModelSerializer):
+    stock_id = serializers.IntegerField(source='stock.id')
     stock_symbol = serializers.CharField(source='stock.symbol')
     stock_name = serializers.CharField(source='stock.company_name')
     current_price = serializers.DecimalField(source='stock.current_price', max_digits=10, decimal_places=2)
+    quantity_owned = serializers.IntegerField(source='quantity')
     total_value = serializers.SerializerMethodField()
     profit_loss = serializers.SerializerMethodField()
     profit_loss_percentage = serializers.SerializerMethodField()
@@ -102,7 +104,7 @@ class PortfolioResponseSerializer(serializers.ModelSerializer):
     class Meta:
         model = UserPortfolio
         fields = [
-            'stock_symbol', 'stock_name', 'quantity', 'average_price', 
+            'stock_id', 'stock_symbol', 'stock_name', 'quantity_owned', 'average_price', 
             'current_price', 'total_value', 'profit_loss', 'profit_loss_percentage'
         ]
     
