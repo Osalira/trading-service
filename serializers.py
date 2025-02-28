@@ -2,9 +2,40 @@ from rest_framework import serializers
 from trading_app.models import Stock, UserPortfolio, Wallet, StockTransaction, WalletTransaction
 
 class StockSerializer(serializers.ModelSerializer):
+    stock_name = serializers.CharField(required=False, write_only=True)
+    
     class Meta:
         model = Stock
         fields = '__all__'
+        extra_kwargs = {
+            'symbol': {'required': False},
+            'company_name': {'required': False},
+            'current_price': {'required': False, 'default': 100.0},
+            'total_shares': {'required': False},
+            'available_shares': {'required': False},
+        }
+    
+    def validate(self, data):
+        # Map stock_name to company_name if provided
+        if 'stock_name' in data and not data.get('company_name'):
+            data['company_name'] = data.pop('stock_name')
+            
+        # Generate a symbol if not provided based on company name
+        if not data.get('symbol') and data.get('company_name'):
+            # Use first 4 letters of company name (uppercase) as symbol
+            company_name = data.get('company_name', '')
+            symbol = ''.join(c for c in company_name if c.isalnum())[:4].upper()
+            data['symbol'] = symbol
+            
+        # Ensure we have required fields either directly or derived
+        if not data.get('company_name'):
+            raise serializers.ValidationError({'company_name': 'Company name is required, either as company_name or stock_name'})
+            
+        # Set default current_price if not provided
+        if not data.get('current_price'):
+            data['current_price'] = 100.0
+            
+        return data
 
 class UserPortfolioSerializer(serializers.ModelSerializer):
     stock_symbol = serializers.CharField(source='stock.symbol', read_only=True)

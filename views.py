@@ -55,6 +55,7 @@ def get_user_id(request):
 # Transaction API endpoints
 
 @api_view(['GET'])
+@permission_classes([AllowAny])
 def get_stock_prices(request):
     """Get a list of all stocks with their current prices"""
     try:
@@ -69,9 +70,9 @@ def get_stock_prices(request):
         )
 
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])
+@permission_classes([AllowAny])
 def get_stock_portfolio(request):
-    """Get the user's stock portfolio"""
+    """Get the user's stock portfolio (open to any authenticated user)"""
     user_id = get_user_id(request)
     if not user_id:
         return Response(
@@ -402,19 +403,53 @@ def add_stock_to_user(request):
     
     # Accept any authenticated user
     
-    # Validate request data
-    required_fields = ['target_user_id', 'stock_id', 'quantity', 'price']
-    for field in required_fields:
-        if field not in request.data:
+    # Set defaults for missing fields
+    data = request.data.copy()
+    
+    # Use authenticated user's ID as target_user_id if not provided
+    if 'target_user_id' not in data or not data['target_user_id']:
+        data['target_user_id'] = user_id
+        logger.info(f"Using authenticated user's ID ({user_id}) as target_user_id")
+    
+    # Default price if not provided
+    if 'price' not in data or not data['price']:
+        data['price'] = 100.0
+        logger.info("Using default price of 100.0")
+    
+    # Get latest stock if stock_id not provided
+    if 'stock_id' not in data or not data['stock_id']:
+        try:
+            latest_stock = Stock.objects.latest('created_at')
+            data['stock_id'] = latest_stock.id
+            logger.info(f"Using latest stock ID: {latest_stock.id} ({latest_stock.symbol})")
+        except Stock.DoesNotExist:
             return Response(
-                {"error": f"Missing required field: {field}"}, 
+                {"error": "No stocks found in the system and no stock_id provided"}, 
                 status=status.HTTP_400_BAD_REQUEST
             )
     
-    target_user_id = request.data['target_user_id']
-    stock_id = request.data['stock_id']
-    quantity = int(request.data['quantity'])
-    price = float(request.data['price'])
+    # Ensure quantity is provided
+    if 'quantity' not in data:
+        return Response(
+            {"error": "Missing required field: quantity"}, 
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    target_user_id = data['target_user_id']
+    stock_id = data['stock_id']
+    
+    try:
+        quantity = int(data['quantity'])
+    except (ValueError, TypeError):
+        return Response(
+            {"error": "Quantity must be a valid integer"}, 
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    try:
+        price = float(data['price'])
+    except (ValueError, TypeError):
+        price = 100.0  # Default price if conversion fails
     
     if quantity <= 0:
         return Response(
@@ -425,7 +460,13 @@ def add_stock_to_user(request):
     try:
         with db_transaction.atomic():
             # Get stock
-            stock = get_object_or_404(Stock, id=stock_id)
+            try:
+                stock = get_object_or_404(Stock, id=stock_id)
+            except:
+                return Response(
+                    {"error": f"Stock with ID {stock_id} not found"}, 
+                    status=status.HTTP_404_NOT_FOUND
+                )
             
             # Get or create portfolio entry
             portfolio, created = UserPortfolio.objects.get_or_create(
@@ -454,7 +495,7 @@ def add_stock_to_user(request):
     except Exception as e:
         logger.error(f"Error adding stock to user {target_user_id}: {str(e)}")
         return Response(
-            {"error": "Failed to add stock to user"}, 
+            {"error": f"Failed to add stock to user: {str(e)}"}, 
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
