@@ -13,9 +13,25 @@ SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-default-key-for-dev
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv('DJANGO_DEBUG', 'True').lower() == 'true'
-
+APPEND_SLASH=False
 # Update ALLOWED_HOSTS to include Docker service name
-ALLOWED_HOSTS = os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1,trading-service,trading-service:8000').split(',')
+# Explicitly list all possible hostnames to ensure they're properly included
+ALLOWED_HOSTS = [
+    'localhost',
+    '127.0.0.1',
+    'trading-service',
+    'trading-service:8000',
+    '*',  # Allow all hosts in development - REMOVE IN PRODUCTION
+]
+
+# Check if we have an environment variable override
+env_hosts = os.getenv('DJANGO_ALLOWED_HOSTS')
+if env_hosts:
+    # Add any hosts from environment variable
+    ALLOWED_HOSTS.extend(env_hosts.split(','))
+    
+# Log the allowed hosts for debugging
+print(f"Django ALLOWED_HOSTS: {ALLOWED_HOSTS}")
 
 # Application definition
 
@@ -38,10 +54,11 @@ MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
+    'middleware.TokenConversionMiddleware',  # Our custom middleware
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
-    'middleware.TokenConversionMiddleware',  # Our custom middleware
+    
 ]
 
 ROOT_URLCONF = 'trading_service_project.urls'

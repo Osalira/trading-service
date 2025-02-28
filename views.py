@@ -5,6 +5,7 @@ from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
+from django.views.decorators.csrf import csrf_exempt
 from rest_framework.response import Response
 import logging
 import requests
@@ -24,12 +25,30 @@ logger = logging.getLogger(__name__)
 
 # Helper function to get user_id from request
 def get_user_id(request):
+    logger.debug("Attempting to get user_id from request")
+    
     # First try to get user_id from our custom authentication class
     if hasattr(request, 'user_id'):
+        logger.debug(f"Found user_id from request attribute: {request.user_id}")
         return request.user_id
     
-    # Fallback to the user_id header (for backward compatibility)
-    return request.headers.get('user_id')
+    # Try to get from the user_id header
+    user_id_header = request.headers.get('user_id')
+    if user_id_header:
+        logger.debug(f"Found user_id from header: {user_id_header}")
+        return user_id_header
+    
+    # As a last resort, try to extract from auth object if present
+    if hasattr(request, 'auth') and request.auth:
+        try:
+            if isinstance(request.auth, dict) and 'id' in request.auth:
+                logger.debug(f"Found user_id from auth object: {request.auth.get('id')}")
+                return request.auth.get('id')
+        except Exception as e:
+            logger.error(f"Error extracting user_id from auth object: {str(e)}")
+    
+    logger.warning("No user_id found in request")
+    return None
 
 # Transaction API endpoints
 
@@ -160,26 +179,73 @@ def add_money_to_wallet(request):
 @permission_classes([IsAuthenticated])
 def get_wallet_balance(request):
     """Get the user's wallet balance"""
-    user_id = get_user_id(request)
+    logger.info(f"get_wallet_balance endpoint accessed from {request.META.get('REMOTE_ADDR')}")
+    logger.info(f"Request method: {request.method}")
+    
+    # Log all headers for debugging
+    logger.debug("Request headers:")
+    for key, value in request.META.items():
+        if key.startswith('HTTP_'):
+            # Mask token values
+            if 'AUTHORIZATION' in key or 'TOKEN' in key:
+                if isinstance(value, str) and len(value) > 20:
+                    logger.debug(f"  {key}: {value[:10]}...{value[-10:]}")
+                else:
+                    logger.debug(f"  {key}: {value}")
+            else:
+                logger.debug(f"  {key}: {value}")
+    
+    # Try multiple ways to get user_id
+    user_id = None
+    
+    # Method 1: From our custom request attribute
+    if hasattr(request, 'user_id'):
+        user_id = request.user_id
+        logger.debug(f"Found user_id from request attribute: {user_id}")
+    
+    # Method 2: From user_id header
+    elif 'HTTP_USER_ID' in request.META:
+        user_id = request.META.get('HTTP_USER_ID')
+        logger.debug(f"Found user_id from HTTP_USER_ID header: {user_id}")
+    
+    # Method 3: From auth object
+    elif hasattr(request, 'auth') and request.auth:
+        try:
+            if isinstance(request.auth, dict) and 'id' in request.auth:
+                user_id = request.auth.get('id')
+                logger.debug(f"Found user_id from auth object: {user_id}")
+        except Exception as e:
+            logger.error(f"Error extracting user_id from auth object: {str(e)}")
+    
     if not user_id:
+        logger.error("No user_id found in request")
         return Response(
-            {"error": "User ID not provided"}, 
+            {"error": "User ID not provided or authentication failed"}, 
             status=status.HTTP_400_BAD_REQUEST
         )
     
     try:
+        logger.info(f"Fetching wallet balance for user_id: {user_id}")
+        
         # Get or create wallet
         wallet, created = Wallet.objects.get_or_create(
             user_id=user_id,
             defaults={'balance': 0}
         )
         
+        if created:
+            logger.info(f"Created new wallet for user {user_id} with zero balance")
+        else:
+            logger.info(f"Found existing wallet for user {user_id} with balance {wallet.balance}")
+        
         serializer = WalletBalanceSerializer(wallet)
         return Response(serializer.data)
     except Exception as e:
         logger.error(f"Error fetching wallet balance for user {user_id}: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
         return Response(
-            {"error": "Failed to fetch wallet balance"}, 
+            {"error": f"Failed to fetch wallet balance: {str(e)}"}, 
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
