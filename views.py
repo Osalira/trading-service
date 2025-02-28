@@ -360,9 +360,9 @@ def get_wallet_transactions(request):
 # Setup endpoints
 
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([AllowAny])
 def create_stock(request):
-    """Create a new stock (admin only)"""
+    """Create a new stock (open to any authenticated user)"""
     user_id = get_user_id(request)
     if not user_id:
         return Response(
@@ -370,8 +370,7 @@ def create_stock(request):
             status=status.HTTP_400_BAD_REQUEST
         )
     
-    # In a real system, check if user is admin
-    # For now, we'll accept any authenticated user
+    # Accept any authenticated user
     
     serializer = StockSerializer(data=request.data)
     if not serializer.is_valid():
@@ -391,9 +390,9 @@ def create_stock(request):
         )
 
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([AllowAny])
 def add_stock_to_user(request):
-    """Add stock to a user's portfolio (admin only)"""
+    """Add stock to a user's portfolio (open to any authenticated user)"""
     user_id = get_user_id(request)
     if not user_id:
         return Response(
@@ -401,8 +400,7 @@ def add_stock_to_user(request):
             status=status.HTTP_400_BAD_REQUEST
         )
     
-    # In a real system, check if user is admin
-    # For now, we'll accept any authenticated user
+    # Accept any authenticated user
     
     # Validate request data
     required_fields = ['target_user_id', 'stock_id', 'quantity', 'price']
