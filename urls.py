@@ -13,13 +13,14 @@ from views import (
 # Add a debug view to help troubleshoot
 from django.http import JsonResponse
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
+import logging
 
 @api_view(['GET', 'POST'])
+@permission_classes([AllowAny])  # Explicitly allow any request, no authentication needed
 def debug_auth(request):
     """Debugging endpoint to help troubleshoot authentication issues"""
     from django.conf import settings
-    import logging
     import json
     import traceback
     import jwt

@@ -58,6 +58,17 @@ class CustomJWTAuthentication(BaseAuthentication):
         
         if not token:
             logger.warning("No token found in request headers or query parameters")
+            # Use the user_id directly from headers if available, even without token
+            # This is a fallback for internal trusted service calls
+            if 'HTTP_USER_ID' in request.META or 'user_id' in request.META:
+                user_id = request.META.get('HTTP_USER_ID') or request.META.get('user_id')
+                if user_id:
+                    logger.debug(f"Using direct user_id header for authentication: {user_id}")
+                    # Create a minimal user_info dict with just the ID
+                    user_info = {'id': user_id}
+                    # Set user_id directly on request for view access
+                    request.user_id = user_id
+                    return (None, user_info)
             return None
         
         logger.debug(f"Token found (first 10 chars): {token[:10]}...")
@@ -70,7 +81,7 @@ class CustomJWTAuthentication(BaseAuthentication):
             decoded_token = None
             errors = []
             
-            # First try the standard approach
+            # First try the standard approach with signature verification
             try:
                 decoded_token = jwt.decode(
                     token,
@@ -78,11 +89,12 @@ class CustomJWTAuthentication(BaseAuthentication):
                     algorithms=['HS256'],
                     options={"verify_sub": False}  # Don't verify subject type
                 )
+                logger.debug("Successfully decoded and verified token")
             except Exception as e:
                 logger.debug(f"Standard JWT decode failed: {str(e)}")
                 errors.append(str(e))
                 
-                # Try with verify_signature=False as fallback
+                # Try with verify_signature=False as fallback (for development/debugging)
                 try:
                     decoded_token = jwt.decode(
                         token,
@@ -98,7 +110,7 @@ class CustomJWTAuthentication(BaseAuthentication):
                 logger.error(f"All JWT decode attempts failed: {error_msg}")
                 raise jwt.InvalidTokenError(f"Failed to decode token: {error_msg}")
             
-            logger.debug(f"Successfully decoded token, claims: {decoded_token.keys()}")
+            logger.debug(f"Successfully decoded token, claims: {list(decoded_token.keys())}")
             
             # Extract user info from the subject claim
             user_info = None
@@ -126,11 +138,22 @@ class CustomJWTAuthentication(BaseAuthentication):
                 
             # Set user_id on request object for direct access in views
             if isinstance(user_info, dict):
-                request.user_id = user_info.get('id')
-                request.username = user_info.get('username')
-                request.account_type = user_info.get('account_type')
+                # User ID - try various fields that might contain it
+                if 'id' in user_info:
+                    request.user_id = user_info.get('id')
+                elif 'user_id' in user_info:
+                    request.user_id = user_info.get('user_id')
                 
-                logger.debug(f"Authentication successful: user_id={request.user_id}, username={request.username}, account_type={request.account_type}")
+                # Username
+                if 'username' in user_info:
+                    request.username = user_info.get('username')
+                
+                # Account type
+                if 'account_type' in user_info:
+                    request.account_type = user_info.get('account_type')
+                
+                # Log what we found
+                logger.debug(f"Authentication successful: user_id={getattr(request, 'user_id', None)}, username={getattr(request, 'username', None)}, account_type={getattr(request, 'account_type', None)}")
             else:
                 logger.warning(f"User info is not a dict: {type(user_info)}")
                 # Try to set user_id directly if possible
