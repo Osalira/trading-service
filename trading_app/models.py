@@ -18,7 +18,7 @@ class Stock(models.Model):
     """Stock model representing a company's stock"""
     symbol = models.CharField(max_length=10, unique=True)
     company_name = models.CharField(max_length=100)
-    current_price = models.DecimalField(max_digits=10, decimal_places=2)
+    current_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     total_shares = models.BigIntegerField(default=0)
     available_shares = models.BigIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -36,7 +36,7 @@ class UserPortfolio(models.Model):
     user_id = models.IntegerField()
     stock = models.ForeignKey(Stock, on_delete=models.CASCADE, related_name='portfolio_entries')
     quantity = models.IntegerField(default=0)
-    average_price = models.DecimalField(max_digits=10, decimal_places=2)
+    average_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     
@@ -63,20 +63,24 @@ class Wallet(models.Model):
 
 class StockTransaction(models.Model):
     """Model for stock buy/sell transactions"""
-    user_id = models.IntegerField()
+    user_id = models.IntegerField(db_index=True)
     stock = models.ForeignKey(Stock, on_delete=models.CASCADE, related_name='transactions')
-    is_buy = models.BooleanField()  # True for buy, False for sell
-    order_type = models.CharField(max_length=20, choices=OrderType.choices)
-    status = models.CharField(max_length=20, choices=OrderStatus.choices)
+    is_buy = models.BooleanField(default=True)
+    order_type = models.CharField(max_length=20, choices=OrderType.choices, default='LIMIT')
+    status = models.CharField(max_length=20, choices=OrderStatus.choices, default=OrderStatus.PENDING)
     quantity = models.IntegerField()
     price = models.DecimalField(max_digits=10, decimal_places=2)
     timestamp = models.DateTimeField(auto_now_add=True)
-    parent_transaction = models.ForeignKey('self', on_delete=models.CASCADE, null=True, blank=True, related_name='child_transactions')
-    wallet_transaction = models.ForeignKey('WalletTransaction', on_delete=models.SET_NULL, null=True, blank=True, related_name='stock_transaction')
+    parent_transaction = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='child_transactions')
+    wallet_transaction = models.ForeignKey('WalletTransaction', on_delete=models.SET_NULL, null=True, blank=True, related_name='stock_transactions')
+    external_order_id = models.BigIntegerField(null=True, blank=True, db_index=True, help_text="ID of the order in the matching engine")
     
     class Meta:
         db_table = 'stock_transactions'
         ordering = ['-timestamp']
+        indexes = [
+            models.Index(fields=['user_id', 'stock', 'is_buy']),
+        ]
     
     def __str__(self):
         action = "Buy" if self.is_buy else "Sell"

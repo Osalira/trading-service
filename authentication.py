@@ -6,11 +6,47 @@ import jwt
 import logging
 import os
 import traceback
+import socket
 
 logger = logging.getLogger(__name__)
 
 # Get JWT secret key from environment or use default
 JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY', 'daytrading_jwt_secret_key_2024')
+
+# Define trusted internal services
+TRUSTED_SERVICES = [
+    'matching-engine',
+    'api-gateway'
+]
+
+# When run in docker, the hostname will resolve to the container IP
+def is_request_from_trusted_service(request):
+    """Check if the request is coming from a trusted internal service"""
+    
+    # Get client IP
+    x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+    if x_forwarded_for:
+        client_ip = x_forwarded_for.split(',')[0]
+    else:
+        client_ip = request.META.get('REMOTE_ADDR')
+    
+    # Check if request is from within the Docker network
+    if client_ip.startswith('172.') or client_ip.startswith('10.'):
+        logger.debug(f"Request from Docker network IP: {client_ip}")
+        return True
+    
+    # Check for specific service headers that might be set by the API gateway
+    request_from = request.META.get('HTTP_X_REQUEST_FROM', '')
+    if request_from in TRUSTED_SERVICES:
+        logger.debug(f"Request from trusted service: {request_from}")
+        return True
+    
+    # If user_id is set in header and no token is provided, it's likely an internal service
+    if 'HTTP_USER_ID' in request.META and not request.META.get('HTTP_AUTHORIZATION'):
+        logger.debug(f"Request with user_id header but no auth token - treating as internal service call")
+        return True
+        
+    return False
 
 class CustomJWTAuthentication(BaseAuthentication):
     """
@@ -20,6 +56,21 @@ class CustomJWTAuthentication(BaseAuthentication):
     """
     
     def authenticate(self, request):
+        # First check if request is from trusted internal service
+        if is_request_from_trusted_service(request):
+            logger.debug("Request from trusted internal service - bypassing token authentication")
+            
+            # Extract user_id from headers if available, or use system user
+            user_id = request.META.get('HTTP_USER_ID', '999')
+            
+            # Create a minimal user_info dict with just the ID
+            user_info = {'id': user_id}
+            
+            # Set user_id directly on request for view access
+            request.user_id = user_id
+            
+            return (None, user_info)
+            
         # Extract token from request headers
         token = None
         
@@ -147,6 +198,8 @@ class CustomJWTAuthentication(BaseAuthentication):
                 # Username
                 if 'username' in user_info:
                     request.username = user_info.get('username')
+                elif 'user_name' in user_info:
+                    request.username = user_info.get('user_name')
                 
                 # Account type
                 if 'account_type' in user_info:

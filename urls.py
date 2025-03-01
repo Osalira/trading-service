@@ -7,7 +7,10 @@ from views import (
     get_wallet_balance,
     get_wallet_transactions,
     create_stock,
-    add_stock_to_user
+    add_stock_to_user,
+    process_transaction,
+    # place_stock_order,
+    process_order_status
 )
 
 # Add a debug view to help troubleshoot
@@ -227,6 +230,12 @@ urlpatterns = [
     path('api/transaction/addMoneyToWallet', add_money_to_wallet, name='add_money_to_wallet'),
     path('api/transaction/getWalletBalance', get_wallet_balance, name='get_wallet_balance'),
     path('api/transaction/getWalletTransactions', get_wallet_transactions, name='get_wallet_transactions'),
+    path('api/transaction/processTransaction', process_transaction, name='process_transaction'),
+    # path('api/transaction/placeStockOrder', place_stock_order, name='place_stock_order'),
+    
+    # Add the new endpoint for order status notifications
+    path('api/transaction/processOrderStatus', process_order_status, name='process_order_status'),
+    path('api/transaction/processOrderStatus/', process_order_status, name='process_order_status_slash'),
     
     # Setup endpoints
     path('api/setup/createStock', create_stock, name='create_stock'),
@@ -242,5 +251,7 @@ urlpatterns = [
     path('api/transaction/addMoneyToWallet/', add_money_to_wallet, name='add_money_to_wallet_slash'),
     path('api/transaction/getWalletBalance/', get_wallet_balance, name='get_wallet_balance_slash'),
     path('api/transaction/getWalletTransactions/', get_wallet_transactions, name='get_wallet_transactions_slash'),
+    path('api/transaction/processTransaction/', process_transaction, name='process_transaction_slash'),
+    # path('api/transaction/placeStockOrder/', place_stock_order, name='place_stock_order_slash'),
     path('api/debug/auth/', debug_auth, name='debug_auth_slash'),
 ] 
