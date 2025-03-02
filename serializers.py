@@ -1,6 +1,9 @@
 from rest_framework import serializers
-from trading_app.models import Stock, UserPortfolio, Wallet, StockTransaction, WalletTransaction
+from trading_app.models import Stock, UserPortfolio, Wallet, StockTransaction, WalletTransaction, OrderStatus
 from decimal import Decimal
+import logging
+
+logger = logging.getLogger(__name__)
 
 class PriceField(serializers.DecimalField):
     """
@@ -98,39 +101,76 @@ class StockTransactionSerializer(serializers.ModelSerializer):
 
 # New serializer for JMeter test format compliance
 class JMeterStockTransactionSerializer(serializers.ModelSerializer):
-    parent_stock_tx_id = serializers.IntegerField(source='parent_transaction.id', read_only=True, allow_null=True)
-    wallet_tx_id = serializers.IntegerField(source='wallet_transaction.id', read_only=True, allow_null=True)
+    """Custom serializer for stock transactions that formats data for JMeter compatibility"""
     stock_id = serializers.IntegerField(source='stock.id')
+    stock_price = serializers.SerializerMethodField()
     order_status = serializers.SerializerMethodField()
-    stock_price = PriceField(source='price', max_digits=10, decimal_places=2)
-    
+    order_type = serializers.CharField()
+    user_id = serializers.CharField()
+    wallet_tx_id = serializers.SerializerMethodField()
+    parent_stock_tx_id = serializers.SerializerMethodField()
+    timestamp = serializers.DateTimeField(format="%Y-%m-%dT%H:%M:%S.%fZ")
+
     class Meta:
         model = StockTransaction
-        fields = [
-            'id', 'user_id', 'stock_id', 'is_buy', 
-            'order_type', 'order_status', 'quantity', 'stock_price', 'timestamp',
-            'parent_stock_tx_id', 'wallet_tx_id', 'external_order_id'
-        ]
-        read_only_fields = ['id', 'timestamp']
-    
+        fields = ['id', 'user_id', 'stock_id', 'quantity', 'stock_price',
+                  'order_status', 'order_type', 'is_buy', 'timestamp',
+                  'wallet_tx_id', 'parent_stock_tx_id', 'external_order_id']
+
+    def get_stock_price(self, obj):
+        """Get the stock price as a string, ensuring it's not zero for market orders"""
+        # If the price is zero but this is a market order that's completed,
+        # attempt to calculate the price from the wallet transaction amount
+        if (obj.price is None or obj.price == 0) and obj.order_type == "MARKET" and obj.status in ["COMPLETED", "Completed"]:
+            if obj.wallet_transaction and obj.wallet_transaction.amount and obj.quantity > 0:
+                # Calculate price from wallet transaction amount
+                calculated_price = abs(obj.wallet_transaction.amount) / obj.quantity
+                # Convert to string and remove trailing .00 if needed
+                price_str = str(calculated_price)
+                if price_str.endswith('.0') or price_str.endswith('.00'):
+                    price_str = price_str.rstrip('0').rstrip('.')
+                return price_str
+        
+        # Otherwise return the stored price
+        if obj.price is None:
+            return "0"
+            
+        # Convert to string and remove trailing .00 if needed
+        price_str = str(obj.price)
+        if price_str.endswith('.0') or price_str.endswith('.00'):
+            price_str = price_str.rstrip('0').rstrip('.')
+        return price_str
+
     def get_order_status(self, obj):
-        """
-        Convert status to the format expected by JMeter tests:
-        - PENDING, IN_PROGRESS, COMPLETED, CANCELLED, PARTIALLY_COMPLETE, FAILED
-        """
+        """Return the order status in uppercase for JMeter compatibility"""
+        # Map status values to the expected format
+        if not obj.status:
+            return "UNKNOWN"
+            
+        # Handle special cases for status formatting
         status_map = {
-            'Pending': 'PENDING',
-            'InProgress': 'IN_PROGRESS',
-            'Completed': 'COMPLETED',
-            'Cancelled': 'CANCELLED',
-            'Partially_complete': 'PARTIALLY_COMPLETE',
-            'Failed': 'FAILED'
+            "InProgress": "IN_PROGRESS",
+            "Partially_complete": "PARTIALLY_COMPLETE"
         }
         
-        # Get the original status and convert to the expected format
-        original_status = obj.status
-        # If it's in our map, use the mapped value; otherwise convert to uppercase
-        return status_map.get(original_status, original_status.upper())
+        # If we have a specific mapping, use it
+        if obj.status in status_map:
+            return status_map[obj.status]
+            
+        # Otherwise just uppercase
+        return obj.status.upper()
+
+    def get_wallet_tx_id(self, obj):
+        """Return the wallet transaction ID if available"""
+        if obj.wallet_transaction:
+            return obj.wallet_transaction.id
+        return None
+
+    def get_parent_stock_tx_id(self, obj):
+        """Return the parent transaction ID if available"""
+        if obj.parent_transaction:
+            return obj.parent_transaction.id
+        return None
 
 class WalletTransactionSerializer(serializers.ModelSerializer):
     stock_symbol = serializers.CharField(source='stock.symbol', read_only=True, allow_null=True)

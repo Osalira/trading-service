@@ -12,6 +12,7 @@ import requests
 import json
 import jwt
 from django.conf import settings
+from decimal import Decimal
 
 from trading_app.models import Stock, UserPortfolio, Wallet, StockTransaction, WalletTransaction, OrderStatus
 from serializers import (
@@ -82,13 +83,13 @@ def get_user_id(request):
 def get_stock_prices(request):
     """Get a list of all stocks with their current prices"""
     try:
-        stocks = Stock.objects.all()
+        stocks = Stock.objects.all().order_by('-company_name')  # Z comes before A
         serializer = StockPriceSerializer(stocks, many=True)
-        return Response(serializer.data)
+        return Response({"success": True, "data": serializer.data})
     except Exception as e:
         logger.error(f"Error fetching stock prices: {str(e)}")
         return Response(
-            {"error": "Failed to fetch stock prices"}, 
+            {"success": False, "error": "Failed to fetch stock prices"}, 
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
@@ -255,23 +256,38 @@ def get_stock_transactions(request):
         offset = int(request.query_params.get('offset', 0))
         
         # Fetch the transactions ordered by timestamp (newest first)
+        # Include related wallet transactions to ensure complete data
         transactions = StockTransaction.objects.filter(user_id=user_id).order_by('timestamp')
+        
+        # Use select_related to fetch related objects in one query
+        transactions = transactions.select_related('stock', 'wallet_transaction', 'parent_transaction')
+        
         logger.debug(f"Found {transactions.count()} transactions")
         
         # Apply pagination if needed
         if limit > 0:
             transactions = transactions[offset:offset+limit]
         
+        # Log details of each transaction for debugging
+        for tx in transactions:
+            logger.debug(f"Transaction {tx.id}: stock={tx.stock_id}, price={tx.price}, wallet_tx={tx.wallet_transaction_id if tx.wallet_transaction else None}")
+            if tx.order_type == 'MARKET' and tx.price == 0 and tx.wallet_transaction:
+                # For market orders with zero price but valid wallet transaction,
+                # log the actual price from the wallet transaction
+                if tx.quantity > 0:
+                    logger.debug(f"  Market order with wallet_tx amount={tx.wallet_transaction.amount}, calculated price={tx.wallet_transaction.amount/tx.quantity}")
+        
         # Serialize the data using JMeter format
         serialized_data = JMeterStockTransactionSerializer(transactions, many=True).data
         
-        # Return just the array of transactions directly
-        return Response(serialized_data)
+        # Return with success key for consistency with other endpoints
+        return Response({"success": True, "data": serialized_data})
     
     except Exception as e:
         logger.error(f"Error fetching stock transactions: {str(e)}")
+        import traceback
         logger.error(traceback.format_exc())
-        return Response({"error": "Internal server error"}, status=500)
+        return Response({"success": False, "error": "Internal server error"}, status=500)
 
 @api_view(['POST'])
 # @permission_classes([IsAuthenticated])
@@ -859,8 +875,19 @@ def process_order_notification(data):
         price = data.get('price', 0)
         external_order_id = data.get('order_id')  # Updated to match the field name from matching engine
         
-        # Validate required fields
-        if not all([user_id, stock_id, quantity, price]):
+        # For market orders that are completed, get the actual execution price from matches
+        actual_matched_price = None
+        if order_type.upper() == 'MARKET' and order_status in [OrderStatus.COMPLETED, 'Completed', OrderStatus.PARTIALLY_COMPLETE, 'Partially_complete']:
+            if 'matches' in data and len(data['matches']) > 0:
+                actual_matched_price = data['matches'][0].get('price', 0)
+                logger.info(f"Found match data with price: {actual_matched_price}")
+                if actual_matched_price > 0:
+                    # Use matched price for the transaction record
+                    price = actual_matched_price
+                    logger.info(f"Using actual matched price {price} for market order")
+        
+        # Validate required fields - check if they exist in the data, not their truthiness
+        if user_id is None or stock_id is None or quantity is None or price is None:
             logger.error(f"Missing required fields in order notification: {data}")
             return Response(
                 {"success": False, "error": "Missing required fields in order notification"}, 
@@ -882,13 +909,24 @@ def process_order_notification(data):
             external_order_id=external_order_id
         )
         
+        transaction = None
+        
         if existing_orders.exists():
             logger.info(f"Order with external ID {external_order_id} already exists, updating status")
             # Update the existing order if needed
             for existing_order in existing_orders:
                 existing_order.status = order_status
+                
+                # For market orders that are completed, update the price with the actual execution price
+                if order_type.upper() == 'MARKET' and order_status in [OrderStatus.COMPLETED, 'Completed', OrderStatus.PARTIALLY_COMPLETE, 'Partially_complete']:
+                    # Check if we need to update the price (if it's still 0)
+                    if existing_order.price == 0 and price > 0:
+                        existing_order.price = price
+                        logger.info(f"Updated market order price from 0 to {price}")
+                
                 existing_order.save()
-                logger.info(f"Updated status of order {existing_order.id} to {order_status}")
+                logger.info(f"Updated status of order {existing_order.id} to {order_status} and price to {existing_order.price}")
+                transaction = existing_order
         else:
             # Create a new order record with reference to the matching engine order
             transaction = StockTransaction.objects.create(
@@ -898,10 +936,61 @@ def process_order_notification(data):
                 order_type=order_type.upper(),
                 status=order_status,
                 quantity=quantity,
-                price=price,
+                price=price,  # Use the actual price from matches if available
                 external_order_id=external_order_id
             )
-            logger.info(f"Created new order record from notification: {transaction.id}, external ID: {external_order_id}")
+            logger.info(f"Created new order record from notification: {transaction.id}, external ID: {external_order_id} with price {price}")
+        
+        # Create wallet transaction for completed or partially completed orders
+        if transaction and transaction.status in [OrderStatus.COMPLETED, OrderStatus.PARTIALLY_COMPLETE, 'Completed', 'Partially_complete']:
+            try:
+                with db_transaction.atomic():
+                    # Skip if this transaction already has a wallet transaction
+                    if transaction.wallet_transaction:
+                        logger.info(f"Skipping wallet transaction creation, already exists: {transaction.wallet_transaction.id}")
+                        return Response(
+                            {"success": True, "data": {"message": "Order notification processed, wallet transaction already exists"}}
+                        )
+                    
+                    # Get or create wallet
+                    wallet, created = Wallet.objects.get_or_create(
+                        user_id=user_id,
+                        defaults={'balance': 0}
+                    )
+                    
+                    # Use the transaction price for calculations - this should now be the actual matched price
+                    # for market orders that have been completed
+                    price_to_use = transaction.price if transaction.price and transaction.price > 0 else price
+                    
+                    # Calculate transaction amount
+                    amount = Decimal(str(price_to_use)) * transaction.quantity
+                    logger.info(f"Calculated transaction amount: {amount} = {price_to_use} × {transaction.quantity}")
+                    
+                    # Create wallet transaction only if it doesn't exist yet
+                    wallet_tx = WalletTransaction.objects.create(
+                        user_id=user_id,
+                        stock=stock,
+                        stock_transaction_id=transaction.id,  # Link directly to the transaction
+                        is_debit=is_buy,  # Debit for buy, credit for sell
+                        amount=amount,
+                        description=f"{'Purchase' if is_buy else 'Sale'} of {transaction.quantity} {stock.symbol} shares at {price_to_use} each"
+                    )
+                    
+                    # Link the wallet transaction to the stock transaction
+                    transaction.wallet_transaction = wallet_tx
+                    transaction.save()
+                    logger.info(f"Created and linked wallet transaction {wallet_tx.id} to stock transaction {transaction.id}")
+                    
+                    # Update wallet balance
+                    if is_buy:
+                        wallet.balance -= amount
+                    else:
+                        wallet.balance += amount
+                    wallet.save()
+                    logger.info(f"Updated wallet balance for user {user_id} to {wallet.balance}")
+            except Exception as e:
+                logger.error(f"Error creating wallet transaction: {str(e)}")
+                logger.error(traceback.format_exc())
             
         # Return success response
         return Response({
@@ -911,6 +1000,7 @@ def process_order_notification(data):
         
     except Exception as e:
         logger.error(f"Error processing order notification: {str(e)}")
+        logger.error(traceback.format_exc())
         return Response(
             {"success": False, "error": f"Error processing order notification: {str(e)}"},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
