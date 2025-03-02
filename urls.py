@@ -10,7 +10,8 @@ from views import (
     add_stock_to_user,
     process_transaction,
     # place_stock_order,
-    process_order_status
+    process_order_status,
+    update_stock_prices
 )
 
 # Add a debug view to help troubleshoot
@@ -240,6 +241,7 @@ urlpatterns = [
     # Setup endpoints
     path('api/setup/createStock', create_stock, name='create_stock'),
     path('api/setup/addStockToUser', add_stock_to_user, name='add_stock_to_user'),
+    path('api/setup/updateStockPrices', update_stock_prices, name='update_stock_prices'),
     
     # Debug endpoints - no authentication required
     path('api/debug/auth', debug_auth, name='debug_auth'),

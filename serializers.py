@@ -1,8 +1,29 @@
 from rest_framework import serializers
 from trading_app.models import Stock, UserPortfolio, Wallet, StockTransaction, WalletTransaction
+from decimal import Decimal
+
+class PriceField(serializers.DecimalField):
+    """
+    Custom field for price values that removes trailing zeros from decimal display.
+    Displays whole numbers (140.00) as integers (140) and keeps decimals when needed (140.50).
+    """
+    def to_representation(self, value):
+        if value is None:
+            return None
+            
+        # Convert to string with decimal places
+        decimal_str = super().to_representation(value)
+        
+        # If it's a whole number, remove the decimal part
+        if '.' in decimal_str:
+            # Strip trailing zeros
+            decimal_str = decimal_str.rstrip('0').rstrip('.')
+            
+        return decimal_str
 
 class StockSerializer(serializers.ModelSerializer):
     stock_name = serializers.CharField(required=False, write_only=True)
+    current_price = PriceField(max_digits=10, decimal_places=2, required=False)
     
     class Meta:
         model = Stock
@@ -10,7 +31,6 @@ class StockSerializer(serializers.ModelSerializer):
         extra_kwargs = {
             'symbol': {'required': False},
             'company_name': {'required': False},
-            'current_price': {'required': False},
             'total_shares': {'required': False},
             'available_shares': {'required': False},
         }
@@ -39,7 +59,7 @@ class StockSerializer(serializers.ModelSerializer):
 class UserPortfolioSerializer(serializers.ModelSerializer):
     stock_symbol = serializers.CharField(source='stock.symbol', read_only=True)
     stock_name = serializers.CharField(source='stock.company_name', read_only=True)
-    current_price = serializers.DecimalField(source='stock.current_price', max_digits=10, decimal_places=2, read_only=True)
+    current_price = PriceField(source='stock.current_price', max_digits=10, decimal_places=2, read_only=True)
     total_value = serializers.SerializerMethodField()
     
     class Meta:
@@ -64,6 +84,7 @@ class StockTransactionSerializer(serializers.ModelSerializer):
     stock_symbol = serializers.CharField(source='stock.symbol', read_only=True)
     parent_id = serializers.IntegerField(source='parent_transaction.id', read_only=True, allow_null=True)
     wallet_transaction_id = serializers.IntegerField(source='wallet_transaction.id', read_only=True, allow_null=True)
+    price = PriceField(max_digits=10, decimal_places=2)
     
     class Meta:
         model = StockTransaction
@@ -75,8 +96,45 @@ class StockTransactionSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'timestamp', 'wallet_transaction', 'wallet_transaction_id']
 
+# New serializer for JMeter test format compliance
+class JMeterStockTransactionSerializer(serializers.ModelSerializer):
+    parent_stock_tx_id = serializers.IntegerField(source='parent_transaction.id', read_only=True, allow_null=True)
+    wallet_tx_id = serializers.IntegerField(source='wallet_transaction.id', read_only=True, allow_null=True)
+    stock_id = serializers.IntegerField(source='stock.id')
+    order_status = serializers.SerializerMethodField()
+    stock_price = PriceField(source='price', max_digits=10, decimal_places=2)
+    
+    class Meta:
+        model = StockTransaction
+        fields = [
+            'id', 'user_id', 'stock_id', 'is_buy', 
+            'order_type', 'order_status', 'quantity', 'stock_price', 'timestamp',
+            'parent_stock_tx_id', 'wallet_tx_id', 'external_order_id'
+        ]
+        read_only_fields = ['id', 'timestamp']
+    
+    def get_order_status(self, obj):
+        """
+        Convert status to the format expected by JMeter tests:
+        - PENDING, IN_PROGRESS, COMPLETED, CANCELLED, PARTIALLY_COMPLETE, FAILED
+        """
+        status_map = {
+            'Pending': 'PENDING',
+            'InProgress': 'IN_PROGRESS',
+            'Completed': 'COMPLETED',
+            'Cancelled': 'CANCELLED',
+            'Partially_complete': 'PARTIALLY_COMPLETE',
+            'Failed': 'FAILED'
+        }
+        
+        # Get the original status and convert to the expected format
+        original_status = obj.status
+        # If it's in our map, use the mapped value; otherwise convert to uppercase
+        return status_map.get(original_status, original_status.upper())
+
 class WalletTransactionSerializer(serializers.ModelSerializer):
     stock_symbol = serializers.CharField(source='stock.symbol', read_only=True, allow_null=True)
+    amount = PriceField(max_digits=12, decimal_places=2)
     
     class Meta:
         model = WalletTransaction
@@ -89,16 +147,20 @@ class WalletTransactionSerializer(serializers.ModelSerializer):
 # Serializers for specific API responses
 
 class StockPriceSerializer(serializers.ModelSerializer):
+    current_price = PriceField(max_digits=10, decimal_places=2)
+    stock_id = serializers.IntegerField(source='id')
+    stock_name = serializers.CharField(source='company_name')
+    
     class Meta:
         model = Stock
-        fields = ['id', 'symbol', 'company_name', 'current_price', 'updated_at']
+        fields = ['stock_id', 'symbol', 'stock_name', 'current_price', 'updated_at']
 
 class PortfolioResponseSerializer(serializers.ModelSerializer):
     stock_id = serializers.CharField(source='stock.id')
     stock_symbol = serializers.CharField(source='stock.symbol')
     stock_name = serializers.CharField(source='stock.company_name')
-    current_price = serializers.DecimalField(source='stock.current_price', max_digits=10, decimal_places=2)
-    average_price = serializers.DecimalField(max_digits=10, decimal_places=2)
+    current_price = PriceField(source='stock.current_price', max_digits=10, decimal_places=2)
+    average_price = PriceField(max_digits=10, decimal_places=2)
     quantity_owned = serializers.IntegerField(source='quantity')
     total_value = serializers.SerializerMethodField()
     profit_loss = serializers.SerializerMethodField()
@@ -199,7 +261,7 @@ class CreateOrderSerializer(serializers.Serializer):
     is_buy = serializers.BooleanField()
     order_type = serializers.ChoiceField(choices=['Market', 'Limit'])
     quantity = serializers.IntegerField(min_value=1)
-    price = serializers.DecimalField(max_digits=10, decimal_places=2, required=False)
+    price = PriceField(max_digits=10, decimal_places=2, required=False)
     external_order_id = serializers.IntegerField(required=False, allow_null=True)
     
     def validate(self, data):
@@ -214,6 +276,8 @@ class AddMoneySerializer(serializers.Serializer):
     amount = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=0.01)
 
 class WalletBalanceSerializer(serializers.ModelSerializer):
+    balance = PriceField(max_digits=12, decimal_places=2)
+    
     class Meta:
         model = Wallet
         fields = ['user_id', 'balance'] 

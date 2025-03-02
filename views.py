@@ -19,7 +19,7 @@ from serializers import (
     StockTransactionSerializer, WalletTransactionSerializer,
     StockPriceSerializer, PortfolioResponseSerializer,
     CreateOrderSerializer, CancelOrderSerializer, AddMoneySerializer,
-    WalletBalanceSerializer
+    WalletBalanceSerializer, JMeterStockTransactionSerializer
 )
 
 # Configure logging
@@ -35,16 +35,31 @@ def get_user_id(request):
         logger.debug(f"Found user_id from query parameter: {user_id_param}")
         return user_id_param
     
+     # Try Django's META dict with HTTP_ prefix
+    for meta_key in ['HTTP_USER_ID', 'HTTP_USERID']:
+        if meta_key in request.META:
+            user_id_meta = request.META.get(meta_key)
+            logger.debug(f"Found user_id from META {meta_key}: {user_id_meta}")
+            return user_id_meta
+
+
     # Second try to get user_id from our custom authentication class
     if hasattr(request, 'user_id'):
         logger.debug(f"Found user_id from request attribute: {request.user_id}")
         return request.user_id
     
-    # Try to get from the user_id header
-    user_id_header = request.headers.get('user_id')
-    if user_id_header:
-        logger.debug(f"Found user_id from header: {user_id_header}")
-        return user_id_header
+    # Try to get from the user_id header - check different formats
+    for header_key in ['user_id', 'User-Id', 'USER_ID', 'userId']:
+        user_id_header = request.headers.get(header_key)
+        if user_id_header:
+            logger.debug(f"Found user_id from header {header_key}: {user_id_header}")
+            return user_id_header
+    
+    # Check the request data for POST/PUT requests
+    if hasattr(request, 'data') and isinstance(request.data, dict) and 'user_id' in request.data:
+        user_id_data = request.data.get('user_id')
+        logger.debug(f"Found user_id in request.data: {user_id_data}")
+        return user_id_data
     
     # As a last resort, try to extract from auth object if present
     if hasattr(request, 'auth') and request.auth:
@@ -59,44 +74,6 @@ def get_user_id(request):
     # Default to user ID 1 for testing instead of None
     logger.info("Using default user ID 1 for testing")
     return "1"
-
-def get_username(request):
-    """Extract the username from request in order of priority: 
-    1. query params, 2. request attribute, 3. headers, 4. auth object"""
-    logger.debug("Attempting to get username from request")
-    
-    # First check query parameters for various username formats
-    for param in ['username', 'user_name']:
-        username_param = request.query_params.get(param)
-        if username_param:
-            logger.debug(f"Found username from query parameter '{param}': {username_param}")
-            return username_param
-    
-    # Check if set directly on request
-    if hasattr(request, 'username'):
-        logger.debug(f"Found username from request attribute: {request.username}")
-        return request.username
-    
-    # Check headers for various username formats
-    for header in ['username', 'user_name', 'HTTP_USERNAME']:
-        username_header = request.headers.get(header)
-        if username_header:
-            logger.debug(f"Found username from header '{header}': {username_header}")
-            return username_header
-    
-    # Try auth object
-    if hasattr(request, 'auth') and request.auth:
-        try:
-            if isinstance(request.auth, dict):
-                for key in ['username', 'user_name']:
-                    if key in request.auth:
-                        logger.debug(f"Found username '{key}' from auth object: {request.auth.get(key)}")
-                        return request.auth.get(key)
-        except Exception as e:
-            logger.error(f"Error extracting username from auth object: {str(e)}")
-    
-    logger.debug("No username found in request")
-    return None
 
 # Transaction API endpoints
 
@@ -124,64 +101,31 @@ def get_stock_portfolio(request):
     if query_user_id:
         logger.info(f"Using user_id {query_user_id} from query parameters")
         user_id = query_user_id
-    else:
+    
         # Fall back to standard user_id extraction
-        user_id = get_user_id(request)
-        logger.info(f"Using user_id {user_id} from authentication")
-    
-    # Get username if available
-    username = get_username(request)
-    if username:
-        logger.info(f"Found username from request: {username}")
-    
-    if not user_id and not username:
-        return Response(
-            {"error": "User identification (ID or username) not provided"}, 
-            status=status.HTTP_400_BAD_REQUEST
-        )
+   
     
     # Log all query parameters for debugging
-    logger.info(f"Query parameters: {dict(request.query_params)}")
     
     try:
-        # Build the query based on available identification
-        portfolio_query = UserPortfolio.objects.all()
-        
-        if user_id:
-            logger.info(f"Filtering portfolio by user_id: {user_id}")
-            portfolio_query = portfolio_query.filter(user_id=user_id)
-        
-        if username:
-            logger.info(f"Filtering portfolio by username: {username}")
-            # Join with user table to filter by username
-            portfolio_query = portfolio_query.filter(user__username=username)
-        
         # Get the portfolio items
-        portfolio = list(portfolio_query)
-        logger.info(f"Portfolio query returned {len(portfolio)} stock items")
+        portfolio = UserPortfolio.objects.filter(user_id=user_id)
+        logger.info(f"User {user_id} portfolio has {len(portfolio)} stock items")
         for item in portfolio:
             logger.info(f"  Stock {item.stock_id} ({item.stock.symbol}): {item.quantity} shares at average price ${item.average_price}")
         
         # Get ALL pending sell orders to exclude stocks that are being sold
         # Using select_related to fetch stock information in a single query
-        pending_orders_query = StockTransaction.objects.filter(
+        pending_sell_orders = StockTransaction.objects.filter(
+            user_id=user_id,
             is_buy=False,  # sell orders
             status__in=['Pending', 'InProgress', 'Partially_complete']  # Explicitly use string literals for SQL query
         ).select_related('stock')
         
-        # Apply filters based on available identification
-        if user_id:
-            pending_orders_query = pending_orders_query.filter(user_id=user_id)
-        
-        if username:
-            pending_orders_query = pending_orders_query.filter(user__username=username)
-        
-        pending_sell_orders = list(pending_orders_query)
-        
         # Log the query and add debugging
-        query_str = str(pending_orders_query.query)
+        query_str = str(pending_sell_orders.query)
         logger.info(f"SQL Query for pending sell orders: {query_str}")
-        logger.info(f"Found {len(pending_sell_orders)} pending sell orders")
+        logger.info(f"Found {pending_sell_orders.count()} pending sell orders for user {user_id}")
         
         for order in pending_sell_orders:
             logger.info(f"  Pending sell order: Stock {order.stock_id} ({order.stock.symbol}), Quantity: {order.quantity}, Status: {order.status}")
@@ -209,7 +153,7 @@ def get_stock_portfolio(request):
                     'external_order_id': order.external_order_id
                 }
         
-        logger.info(f"Found {len(pending_sells_by_stock)} stocks with pending sell orders")
+        logger.info(f"Found {len(pending_sells_by_stock)} stocks with pending sell orders for user {user_id}")
         for stock_id, quantity in pending_sells_by_stock.items():
             status_info = transaction_status_by_stock.get(stock_id, {}).get('status', 'Unknown')
             logger.info(f"  Stock {stock_id}: {quantity} shares pending sell, status: {status_info}")
@@ -265,7 +209,7 @@ def get_stock_portfolio(request):
         
         # Explicitly return empty array when no stocks are available
         if not available_portfolio:
-            logger.info(f"User has no available stocks due to pending sell orders - returning empty array")
+            logger.info(f"User {user_id} has no available stocks due to pending sell orders - returning empty array")
             return Response({'success': True, 'data': []})
         
         # Serialize the portfolio with status information
@@ -280,7 +224,7 @@ def get_stock_portfolio(request):
         
         return Response({'success': True, 'data': serializer.data})
     except Exception as e:
-        logger.error(f"Error fetching portfolio: {str(e)}")
+        logger.error(f"Error fetching portfolio for user {user_id}: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
         return Response(
@@ -291,36 +235,43 @@ def get_stock_portfolio(request):
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def get_stock_transactions(request):
-    """Get the user's stock transaction history"""
-    user_id = get_user_id(request)
-    if not user_id:
-        return Response(
-            {"error": "User ID not provided"}, 
-            status=status.HTTP_400_BAD_REQUEST
-        )
-    
+    """
+    Get a user's stock transaction history
+    """
     try:
-        # Get transaction parameters from query string
-        limit = int(request.query_params.get('limit', 50))
+        # Always use JMeter format for this endpoint
+        use_jmeter_format = True
+        logger.debug(f"Using JMeter format: {use_jmeter_format}")
+        
+        # Get the user ID from the request
+        user_id = get_user_id(request)
+        if not user_id:
+            return Response({"error": "User ID is required"}, status=400)
+        
+        logger.debug(f"Fetching stock transactions for user ID: {user_id}")
+        
+        # Get pagination parameters from the query string
+        limit = int(request.query_params.get('limit', 100))
         offset = int(request.query_params.get('offset', 0))
         
-        # Get transactions
-        transactions = StockTransaction.objects.filter(user_id=user_id).order_by('-timestamp')[offset:offset+limit]
-        serializer = StockTransactionSerializer(transactions, many=True)
+        # Fetch the transactions ordered by timestamp (newest first)
+        transactions = StockTransaction.objects.filter(user_id=user_id).order_by('timestamp')
+        logger.debug(f"Found {transactions.count()} transactions")
         
-        # Return total count and results
-        total_count = StockTransaction.objects.filter(user_id=user_id).count()
+        # Apply pagination if needed
+        if limit > 0:
+            transactions = transactions[offset:offset+limit]
         
-        return Response({
-            "total_count": total_count,
-            "transactions": serializer.data
-        })
+        # Serialize the data using JMeter format
+        serialized_data = JMeterStockTransactionSerializer(transactions, many=True).data
+        
+        # Return just the array of transactions directly
+        return Response(serialized_data)
+    
     except Exception as e:
-        logger.error(f"Error fetching stock transactions for user {user_id}: {str(e)}")
-        return Response(
-            {"error": "Failed to fetch stock transactions"}, 
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+        logger.error(f"Error fetching stock transactions: {str(e)}")
+        logger.error(traceback.format_exc())
+        return Response({"error": "Internal server error"}, status=500)
 
 @api_view(['POST'])
 # @permission_classes([IsAuthenticated])
@@ -598,11 +549,9 @@ def create_stock(request):
 def add_stock_to_user(request):
     """Add stock to a user's portfolio (open to any authenticated user)"""
     user_id = get_user_id(request)
-    username = get_username(request)
-    
-    if not user_id and not username:
+    if not user_id:
         return Response(
-            {"error": "User identification (ID or username) not provided"}, 
+            {"error": "User ID not provided"}, 
             status=status.HTTP_400_BAD_REQUEST
         )
     
@@ -612,25 +561,9 @@ def add_stock_to_user(request):
     data = request.data.copy()
     
     # Use authenticated user's ID as target_user_id if not provided
-    target_user_id = None
-    target_username = None
-    
-    if 'target_user_id' in data and data['target_user_id']:
-        target_user_id = data['target_user_id']
-        logger.info(f"Using provided target_user_id: {target_user_id}")
-    elif user_id:
-        target_user_id = user_id
+    if 'target_user_id' not in data or not data['target_user_id']:
         data['target_user_id'] = user_id
         logger.info(f"Using authenticated user's ID ({user_id}) as target_user_id")
-    
-    # Check for target username
-    if 'target_username' in data and data['target_username']:
-        target_username = data['target_username']
-        logger.info(f"Using provided target_username: {target_username}")
-    elif username:
-        target_username = username
-        data['target_username'] = username
-        logger.info(f"Using authenticated username ({username}) as target_username")
     
     # Get latest stock if stock_id not provided
     if 'stock_id' not in data or not data['stock_id']:
@@ -651,6 +584,7 @@ def add_stock_to_user(request):
             status=status.HTTP_400_BAD_REQUEST
         )
     
+    target_user_id = data['target_user_id']
     stock_id = data['stock_id']
     
     try:
@@ -671,65 +605,29 @@ def add_stock_to_user(request):
         with db_transaction.atomic():
             # Get stock
             try:
-                stock = get_object_or_404(Stock, id=stock_id)
-            except:
+                stock = Stock.objects.get(id=stock_id)
+            except Stock.DoesNotExist:
                 return Response(
                     {"error": f"Stock with ID {stock_id} not found"}, 
                     status=status.HTTP_404_NOT_FOUND
                 )
-            
-            # Try to identify the user
-            user_filter = {}
-            
-            if target_user_id:
-                user_filter['user_id'] = target_user_id
-            
-            if target_username:
-                user_filter['user__username'] = target_username
-            
             # Get or create portfolio entry
-            try:
-                if target_user_id:
-                    # If we have a user ID, use it directly
-                    portfolio, _ = UserPortfolio.objects.get_or_create(
-                        user_id=target_user_id,
-                        stock=stock,
-                        defaults={'quantity': 0}
-                    )
-                elif target_username:
-                    # If we only have a username, look up the user first
-                    from django.contrib.auth.models import User
-                    try:
-                        user = User.objects.get(username=target_username)
-                        portfolio, _ = UserPortfolio.objects.get_or_create(
-                            user_id=user.id,
-                            stock=stock,
-                            defaults={'quantity': 0}
-                        )
-                    except User.DoesNotExist:
-                        return Response(
-                            {"error": f"User with username '{target_username}' not found"}, 
-                            status=status.HTTP_404_NOT_FOUND
-                        )
-                else:
-                    return Response(
-                        {"error": "Could not determine target user"}, 
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-                
-                # Just update the quantity, don't touch average_price
-                portfolio.quantity += data['quantity']
-                portfolio.save()
-                
-                return Response({
-                    "message": "Stock added to user portfolio",
-                    "portfolio": UserPortfolioSerializer(portfolio).data
-                })
-            except Exception as e:
-                logger.error(f"Error finding or creating portfolio: {str(e)}")
-                raise
+            portfolio, _ = UserPortfolio.objects.get_or_create(
+                user_id=target_user_id,
+                stock=stock,
+                defaults={'quantity': 0}
+            )
+            
+            # Just update the quantity, don't touch average_price
+            portfolio.quantity += data['quantity']
+            portfolio.save()
+            
+            return Response({
+                "message": "Stock added to user portfolio",
+                "portfolio": UserPortfolioSerializer(portfolio).data
+            })
     except Exception as e:
-        logger.error(f"Error adding stock to user: {str(e)}")
+        logger.error(f"Error adding stock to user {target_user_id}: {str(e)}")
         return Response(
             {"error": f"Failed to add stock to user: {str(e)}"}, 
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -778,6 +676,17 @@ def process_transaction(request):
             logger.info(f"Sell order external ID: {sell_order_id}")
         
         with db_transaction.atomic():
+            # Update the stock price to reflect the latest transaction price
+            try:
+                stock = Stock.objects.get(id=stock_id)
+                stock.current_price = price
+                stock.save()
+                logger.info(f"Updated stock {stock.symbol} price to {price} based on transaction")
+            except Stock.DoesNotExist:
+                logger.error(f"Stock with ID {stock_id} not found when trying to update price")
+            except Exception as e:
+                logger.error(f"Error updating stock price: {str(e)}")
+            
             # Find and update pending sell orders
             sell_orders_query = StockTransaction.objects.filter(
                 user_id=sell_user_id,
@@ -1028,113 +937,50 @@ def process_order_status(request):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
-# @api_view(['POST'])
-# @permission_classes([AllowAny])
-# def place_stock_order(request):
-#     """Place a stock order directly in trading service
-    
-#     This endpoint is for testing and development only.
-#     It allows placing orders without going through the matching engine.
-#     """
-#     user_id = get_user_id(request)
-#     if not user_id:
-#         return Response(
-#             {"success": False, "error": "User ID not provided"}, 
-#             status=status.HTTP_400_BAD_REQUEST
-#         )
-    
-#     try:
-#         data = request.data
-#         stock_id = data.get('stock_id')
-#         is_buy = data.get('is_buy', True)
-#         order_type = data.get('order_type', 'LIMIT')
-#         quantity = data.get('quantity')
-#         price = data.get('price')
-#         external_order_id = data.get('external_order_id')  # Accept external_order_id if provided
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def update_stock_prices(request):
+    """Update stock prices directly (for testing purposes)"""
+    try:
+        data = request.data
+        logger.info(f"Received stock price update request: {data}")
         
-#         # Log all input data for debugging
-#         logger.info(f"place_stock_order request from user {user_id}: stock_id={stock_id}, is_buy={is_buy}, order_type={order_type}, quantity={quantity}, price={price}, external_order_id={external_order_id}")
-        
-#         # Validate inputs
-#         if not stock_id:
-#             return Response(
-#                 {"success": False, "error": "Stock ID is required"}, 
-#                 status=status.HTTP_400_BAD_REQUEST
-#             )
-        
-#         if not quantity or quantity <= 0:
-#             return Response(
-#                 {"success": False, "error": "Quantity must be positive"}, 
-#                 status=status.HTTP_400_BAD_REQUEST
-#             )
-        
-#         if not price or price <= 0:
-#             return Response(
-#                 {"success": False, "error": "Price must be positive"}, 
-#                 status=status.HTTP_400_BAD_REQUEST
-#             )
-        
-#         # Get stock
-#         try:
-#             stock = Stock.objects.get(id=stock_id)
-#             logger.info(f"Found stock: {stock.id} ({stock.symbol}) for order")
-#         except Stock.DoesNotExist:
-#             logger.error(f"Stock with ID {stock_id} not found")
-#             return Response(
-#                 {"success": False, "error": f"Stock with ID {stock_id} not found"}, 
-#                 status=status.HTTP_404_NOT_FOUND
-#             )
-        
-#         # For sell orders, check if user has enough shares
-#         if not is_buy:
-#             try:
-#                 portfolio = UserPortfolio.objects.get(user_id=user_id, stock=stock)
-#                 logger.info(f"User {user_id} has {portfolio.quantity} shares of stock {stock_id} ({stock.symbol})")
-#                 if portfolio.quantity < quantity:
-#                     logger.warning(f"Insufficient shares: User has {portfolio.quantity}, attempting to sell {quantity}")
-#                     return Response(
-#                         {"success": False, "error": f"Insufficient shares. You own {portfolio.quantity} shares, but attempted to sell {quantity}."}, 
-#                         status=status.HTTP_400_BAD_REQUEST
-#                     )
-#             except UserPortfolio.DoesNotExist:
-#                 logger.error(f"User {user_id} doesn't own any shares of stock {stock_id} ({stock.symbol})")
-#                 return Response(
-#                     {"success": False, "error": "You don't own any shares of this stock"}, 
-#                     status=status.HTTP_400_BAD_REQUEST
-#                 )
-        
-#         # Create the order
-#         transaction = StockTransaction.objects.create(
-#             user_id=user_id,
-#             stock=stock,
-#             is_buy=is_buy,
-#             order_type=order_type.upper(),
-#             status=OrderStatus.IN_PROGRESS,  # Mark as InProgress
-#             quantity=quantity,
-#             price=price,
-#             external_order_id=external_order_id  # Store external_order_id if provided
-#         )
-        
-#         logger.info(f"Created a new {'buy' if is_buy else 'sell'} order (ID: {transaction.id}, external ID: {external_order_id}) for {quantity} shares of {stock.symbol} at ${price}, status={transaction.status}")
-        
-#         # Return success response with more details including stock_id and name
-#         return Response({
-#             "success": True,
-#             "data": {
-#                 "order_id": transaction.id,
-#                 "external_order_id": transaction.external_order_id,
-#                 "status": transaction.status,
-#                 "stock_id": stock.id,
-#                 "stock_symbol": stock.symbol,
-#                 "matches": None
-#             }
-#         })
-#     except Exception as e:
-#         logger.error(f"Error placing order for user {user_id}: {str(e)}")
-#         return Response(
-#             {"success": False, "error": f"Failed to place order: {str(e)}"}, 
-#             status=status.HTTP_500_INTERNAL_SERVER_ERROR
-#         )
+        if not isinstance(data, list):
+            data = [data]  # Convert single item to list
+            
+        updated_stocks = []
+        for item in data:
+            stock_id = item.get('stock_id')
+            current_price = item.get('current_price')
+            
+            if not stock_id or current_price is None:
+                continue
+                
+            try:
+                stock = Stock.objects.get(id=stock_id)
+                stock.current_price = current_price
+                stock.save()
+                updated_stocks.append({
+                    'stock_id': stock.id,
+                    'symbol': stock.symbol,
+                    'stock_name': stock.company_name,
+                    'current_price': stock.current_price
+                })
+                logger.info(f"Updated stock {stock.symbol} price to {current_price}")
+            except Stock.DoesNotExist:
+                logger.error(f"Stock with ID {stock_id} not found")
+                
+        return Response({
+            "success": True,
+            "message": f"Updated {len(updated_stocks)} stock prices",
+            "data": updated_stocks
+        })
+    except Exception as e:
+        logger.error(f"Error updating stock prices: {str(e)}")
+        return Response(
+            {"success": False, "error": f"Failed to update stock prices: {str(e)}"},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 # URL patterns (to be imported in urls.py)
 # These are the URL patterns to include in your urls.py file

@@ -41,8 +41,17 @@ def is_request_from_trusted_service(request):
         logger.debug(f"Request from trusted service: {request_from}")
         return True
     
-    # If user_id is set in header and no token is provided, it's likely an internal service
-    if 'HTTP_USER_ID' in request.META and not request.META.get('HTTP_AUTHORIZATION'):
+    # Check for user_id in various possible header formats
+    # This is a comprehensive check for different ways the header might be passed
+    has_user_id_header = (
+        'HTTP_USER_ID' in request.META or 
+        'user_id' in request.META or
+        'USER_ID' in request.META or
+        request.META.get('HTTP_USER_ID') is not None or
+        request.headers.get('user_id') is not None
+    )
+    
+    if has_user_id_header and not request.META.get('HTTP_AUTHORIZATION'):
         logger.debug(f"Request with user_id header but no auth token - treating as internal service call")
         return True
         
@@ -60,8 +69,46 @@ class CustomJWTAuthentication(BaseAuthentication):
         if is_request_from_trusted_service(request):
             logger.debug("Request from trusted internal service - bypassing token authentication")
             
-            # Extract user_id from headers if available, or use system user
-            user_id = request.META.get('HTTP_USER_ID', '999')
+            # Try to extract user_id from multiple possible places, with detailed logging
+            user_id = None
+            
+            # Check HTTP_USER_ID (Django standard format)
+            if 'HTTP_USER_ID' in request.META:
+                user_id = request.META.get('HTTP_USER_ID')
+                logger.debug(f"Found user_id in HTTP_USER_ID header: {user_id}")
+            
+            # Check regular header via request.headers dict
+            elif request.headers.get('user_id'):
+                user_id = request.headers.get('user_id')
+                logger.debug(f"Found user_id in request.headers: {user_id}")
+            
+            # Check direct META key (less common)
+            elif 'user_id' in request.META:
+                user_id = request.META.get('user_id')
+                logger.debug(f"Found user_id in direct META: {user_id}")
+                
+            # Check in body for POST/PUT requests
+            elif hasattr(request, 'data') and isinstance(request.data, dict) and 'user_id' in request.data:
+                user_id = request.data.get('user_id')
+                logger.debug(f"Found user_id in request.data: {user_id}")
+                
+            # If still no user_id found, check query parameters
+            elif request.GET.get('user_id'):
+                user_id = request.GET.get('user_id')
+                logger.debug(f"Found user_id in query parameters: {user_id}")
+            
+            # Default to system user only if no user_id was found anywhere
+            if user_id is None:
+                user_id = '999'
+                logger.warning(f"No user_id found in request, defaulting to system user: {user_id}")
+            
+            # Ensure user_id is treated as integer/string consistently
+            try:
+                user_id = str(user_id)  # Convert to string first
+                logger.debug(f"Final user_id for authentication: {user_id}")
+            except Exception as e:
+                logger.error(f"Error converting user_id: {str(e)}")
+                user_id = '999'  # Fallback to system user
             
             # Create a minimal user_info dict with just the ID
             user_info = {'id': user_id}
@@ -198,8 +245,6 @@ class CustomJWTAuthentication(BaseAuthentication):
                 # Username
                 if 'username' in user_info:
                     request.username = user_info.get('username')
-                elif 'user_name' in user_info:
-                    request.username = user_info.get('user_name')
                 
                 # Account type
                 if 'account_type' in user_info:
