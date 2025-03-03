@@ -102,6 +102,7 @@ class StockTransactionSerializer(serializers.ModelSerializer):
 # New serializer for JMeter test format compliance
 class JMeterStockTransactionSerializer(serializers.ModelSerializer):
     """Custom serializer for stock transactions that formats data for JMeter compatibility"""
+    stock_tx_id = serializers.IntegerField(source='id')
     stock_id = serializers.IntegerField(source='stock.id')
     stock_price = serializers.SerializerMethodField()
     order_status = serializers.SerializerMethodField()
@@ -113,7 +114,7 @@ class JMeterStockTransactionSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = StockTransaction
-        fields = ['id', 'user_id', 'stock_id', 'quantity', 'stock_price',
+        fields = ['stock_tx_id', 'user_id', 'stock_id', 'quantity', 'stock_price',
                   'order_status', 'order_type', 'is_buy', 'timestamp',
                   'wallet_tx_id', 'parent_stock_tx_id', 'external_order_id']
 
@@ -183,6 +184,23 @@ class WalletTransactionSerializer(serializers.ModelSerializer):
             'is_debit', 'amount', 'description', 'timestamp'
         ]
         read_only_fields = ['id', 'timestamp']
+
+# JMeter specific wallet transaction serializer
+class JMeterWalletTransactionSerializer(serializers.ModelSerializer):
+    """Custom serializer for wallet transactions that formats data for JMeter compatibility"""
+    wallet_tx_id = serializers.IntegerField(source='id')
+    stock_tx_id = serializers.IntegerField(source='stock_transaction_id', allow_null=True)
+    stock_id = serializers.IntegerField(source='stock.id', allow_null=True)
+    stock_symbol = serializers.CharField(source='stock.symbol', read_only=True, allow_null=True)
+    amount = PriceField(max_digits=12, decimal_places=2)
+    timestamp = serializers.DateTimeField(format="%Y-%m-%dT%H:%M:%S.%fZ")
+    
+    class Meta:
+        model = WalletTransaction
+        fields = [
+            'wallet_tx_id', 'stock_tx_id', 'user_id', 'stock_id', 'stock_symbol',
+            'is_debit', 'amount', 'description', 'timestamp'
+        ]
 
 # Serializers for specific API responses
 

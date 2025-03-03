@@ -20,7 +20,8 @@ from serializers import (
     StockTransactionSerializer, WalletTransactionSerializer,
     StockPriceSerializer, PortfolioResponseSerializer,
     CreateOrderSerializer, CancelOrderSerializer, AddMoneySerializer,
-    WalletBalanceSerializer, JMeterStockTransactionSerializer
+    WalletBalanceSerializer, JMeterStockTransactionSerializer,
+    JMeterWalletTransactionSerializer
 )
 
 # Configure logging
@@ -104,8 +105,7 @@ def get_stock_portfolio(request):
         user_id = query_user_id
     
         # Fall back to standard user_id extraction
-   
-    
+        user_id = get_user_id(request)
     # Log all query parameters for debugging
     
     try:
@@ -497,7 +497,7 @@ def get_wallet_transactions(request):
     user_id = get_user_id(request)
     if not user_id:
         return Response(
-            {"error": "User ID not provided"}, 
+            {"success": False, "error": "User ID not provided"}, 
             status=status.HTTP_400_BAD_REQUEST
         )
     
@@ -508,19 +508,32 @@ def get_wallet_transactions(request):
         
         # Get transactions
         transactions = WalletTransaction.objects.filter(user_id=user_id).order_by('-timestamp')[offset:offset+limit]
-        serializer = WalletTransactionSerializer(transactions, many=True)
         
-        # Return total count and results
-        total_count = WalletTransaction.objects.filter(user_id=user_id).count()
+        # Check if JMeter format is requested (default to true for compatibility)
+        use_jmeter_format = request.query_params.get('jmeter_format', 'true').lower() == 'true'
         
-        return Response({
-            "total_count": total_count,
-            "transactions": serializer.data
-        })
+        if use_jmeter_format:
+            # Use JMeter format - data is a direct array of transactions
+            serializer = JMeterWalletTransactionSerializer(transactions, many=True)
+            return Response({
+                "success": True,
+                "data": serializer.data
+            })
+        else:
+            # Use original format with nested transactions array
+            serializer = WalletTransactionSerializer(transactions, many=True)
+            total_count = WalletTransaction.objects.filter(user_id=user_id).count()
+            return Response({
+                "success": True,
+                "data": {
+                    "total_count": total_count,
+                    "transactions": serializer.data
+                }
+            })
     except Exception as e:
         logger.error(f"Error fetching wallet transactions for user {user_id}: {str(e)}")
         return Response(
-            {"error": "Failed to fetch wallet transactions"}, 
+            {"success": False, "error": f"Failed to fetch wallet transactions: {str(e)}"}, 
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
@@ -988,6 +1001,63 @@ def process_order_notification(data):
                         wallet.balance += amount
                     wallet.save()
                     logger.info(f"Updated wallet balance for user {user_id} to {wallet.balance}")
+                    
+                    # Update user's portfolio for buy orders
+                    if is_buy and transaction.status in [OrderStatus.COMPLETED, 'Completed', OrderStatus.PARTIALLY_COMPLETE, 'Partially_complete']:
+                        try:
+                            # Get or create portfolio entry
+                            portfolio, created = UserPortfolio.objects.get_or_create(
+                                user_id=user_id,
+                                stock_id=stock_id,
+                                defaults={
+                                    'quantity': 0,
+                                    'average_price': 0,
+                                    'stock': stock
+                                }
+                            )
+                            
+                            # Update average price
+                            current_value = portfolio.quantity * portfolio.average_price
+                            new_value = transaction.quantity * price_to_use
+                            total_quantity = portfolio.quantity + transaction.quantity
+                            
+                            if total_quantity > 0:
+                                portfolio.average_price = (current_value + new_value) / total_quantity
+                            
+                            # Update quantity
+                            portfolio.quantity += transaction.quantity
+                            portfolio.save()
+                            
+                            logger.info(f"Updated portfolio for user {user_id}: stock {stock_id}, new quantity: {portfolio.quantity}, avg price: {portfolio.average_price}")
+                        except Exception as e:
+                            logger.error(f"Error updating portfolio: {str(e)}")
+                            logger.error(traceback.format_exc())
+                    # Update user's portfolio for sell orders
+                    elif not is_buy and transaction.status in [OrderStatus.COMPLETED, 'Completed', OrderStatus.PARTIALLY_COMPLETE, 'Partially_complete']:
+                        try:
+                            # Get portfolio entry
+                            try:
+                                portfolio = UserPortfolio.objects.get(
+                                    user_id=user_id,
+                                    stock_id=stock_id
+                                )
+                                
+                                # Update quantity (decrease for sell)
+                                portfolio.quantity -= transaction.quantity
+                                
+                                # Ensure we don't go negative
+                                if portfolio.quantity < 0:
+                                    logger.warning(f"Correcting negative portfolio quantity for user {user_id}, stock {stock_id}")
+                                    portfolio.quantity = 0
+                                    
+                                portfolio.save()
+                                
+                                logger.info(f"Updated portfolio for seller {user_id}: stock {stock_id}, new quantity: {portfolio.quantity}")
+                            except UserPortfolio.DoesNotExist:
+                                logger.warning(f"No portfolio entry found for seller {user_id}, stock {stock_id}")
+                        except Exception as e:
+                            logger.error(f"Error updating seller portfolio: {str(e)}")
+                            logger.error(traceback.format_exc())
             except Exception as e:
                 logger.error(f"Error creating wallet transaction: {str(e)}")
                 logger.error(traceback.format_exc())
