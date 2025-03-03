@@ -773,8 +773,46 @@ def process_transaction(request):
                         portfolio.quantity -= order_quantity
                         portfolio.save()
                         logger.info(f"Updated seller portfolio: {sell_user_id}, stock: {stock_id}, new quantity: {portfolio.quantity}")
+                        
+                        # Create wallet transaction for the seller
+                        try:
+                            # Skip if this order already has a wallet transaction
+                            if order.wallet_transaction:
+                                logger.info(f"Skipping wallet transaction creation for seller, already exists: {order.wallet_transaction.id}")
+                            else:
+                                # Get or create wallet for the seller
+                                wallet, created = Wallet.objects.get_or_create(
+                                    user_id=sell_user_id,
+                                    defaults={'balance': 0}
+                                )
+                                
+                                # Calculate transaction amount
+                                amount = Decimal(str(price)) * order_quantity
+                                logger.info(f"Calculated seller transaction amount: {amount} = {price} × {order_quantity}")
+                                
+                                # Create wallet transaction for seller
+                                wallet_tx = WalletTransaction.objects.create(
+                                    user_id=sell_user_id,
+                                    stock=Stock.objects.get(id=stock_id),
+                                    stock_transaction_id=order.id,
+                                    is_debit=False,  # Credit for sell
+                                    amount=amount,
+                                    description=f"Sale of {order_quantity} {Stock.objects.get(id=stock_id).symbol} shares at {price} each"
+                                )
+                                
+                                # Link the wallet transaction to the stock transaction
+                                order.wallet_transaction = wallet_tx
+                                order.save()
+                                logger.info(f"Created and linked wallet transaction {wallet_tx.id} to sell order {order.id}")
+                                
+                                # Update seller wallet balance
+                                wallet.balance += amount
+                                wallet.save()
+                                logger.info(f"Updated seller wallet: {sell_user_id}, new balance: {wallet.balance}")
+                        except Exception as e:
+                            logger.error(f"Error creating wallet transaction for seller: {str(e)}")
                     except UserPortfolio.DoesNotExist:
-                        logger.warning(f"Portfolio not found for sell user {sell_user_id} and stock {stock_id}")
+                        logger.warning(f"No portfolio entry found for seller {sell_user_id}, stock {stock_id}")
                 
                 if remaining_quantity > 0:
                     logger.warning(f"Not all quantity matched for sell orders. Remaining: {remaining_quantity}")
