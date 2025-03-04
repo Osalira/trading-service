@@ -9,7 +9,7 @@ ENV DJANGO_SETTINGS_MODULE=trading_service_project.settings
 # Set work directory
 WORKDIR /app
 
-# Install system dependencies (added curl here)
+# Install system dependencies (added debugging tools)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         postgresql-client \
@@ -17,6 +17,8 @@ RUN apt-get update \
         libpq-dev \
         netcat-openbsd \
         curl \
+        strace \
+        dos2unix \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
@@ -32,16 +34,15 @@ RUN mkdir -p staticfiles logs
 
 # Create a non-root user
 RUN adduser --disabled-password --gecos '' appuser
-RUN chown -R appuser:appuser /app
 
-# Create entrypoint script
-COPY --chown=appuser:appuser ./docker-entrypoint.sh /app/docker-entrypoint.sh
-
-# Make the script executable with verbose output for debugging
+# Fix script permissions and ensure Unix line endings
 RUN chmod +x /app/docker-entrypoint.sh && \
+    dos2unix /app/docker-entrypoint.sh && \
     echo "Entrypoint script permissions: $(ls -la /app/docker-entrypoint.sh)" && \
     echo "Build timestamp: $(date)" && \
-    cat /app/docker-entrypoint.sh | head -n 1
+    cat /app/docker-entrypoint.sh | head -n 3
+
+RUN chown -R appuser:appuser /app
 
 # Switch to non-root user
 USER appuser
