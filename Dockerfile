@@ -33,11 +33,18 @@ RUN mkdir -p staticfiles logs
 # Create a non-root user
 RUN adduser --disabled-password --gecos '' appuser
 RUN chown -R appuser:appuser /app
-USER appuser
 
 # Create entrypoint script
 COPY --chown=appuser:appuser ./docker-entrypoint.sh /app/docker-entrypoint.sh
-RUN chmod +x /app/docker-entrypoint.sh
+
+# Make the script executable with verbose output for debugging
+RUN chmod +x /app/docker-entrypoint.sh && \
+    echo "Entrypoint script permissions: $(ls -la /app/docker-entrypoint.sh)" && \
+    echo "Build timestamp: $(date)" && \
+    cat /app/docker-entrypoint.sh | head -n 1
+
+# Switch to non-root user
+USER appuser
 
 # Expose the port the app runs on
 EXPOSE 8000
