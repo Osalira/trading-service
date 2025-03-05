@@ -35,7 +35,7 @@ class UserPortfolio(models.Model):
     """Portfolio model representing a user's stock holdings"""
     user_id = models.IntegerField()
     stock = models.ForeignKey(Stock, on_delete=models.CASCADE, related_name='portfolio_entries')
-    quantity = models.IntegerField(default=0)
+    quantity = models.BigIntegerField(default=0)
     average_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -68,7 +68,7 @@ class StockTransaction(models.Model):
     is_buy = models.BooleanField(default=True)
     order_type = models.CharField(max_length=20, choices=OrderType.choices, default='LIMIT')
     status = models.CharField(max_length=20, choices=OrderStatus.choices, default=OrderStatus.PENDING)
-    quantity = models.IntegerField()
+    quantity = models.BigIntegerField()
     price = models.DecimalField(max_digits=10, decimal_places=2)
     timestamp = models.DateTimeField(auto_now_add=True)
     parent_transaction = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='child_transactions')
