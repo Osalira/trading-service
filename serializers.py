@@ -3,6 +3,7 @@ from trading_app.models import Stock, UserPortfolio, Wallet, StockTransaction, W
 from decimal import Decimal
 import logging
 
+# Configure logging
 logger = logging.getLogger(__name__)
 
 class PriceField(serializers.DecimalField):
@@ -106,7 +107,7 @@ class JMeterStockTransactionSerializer(serializers.ModelSerializer):
     stock_id = serializers.IntegerField(source='stock.id')
     stock_price = serializers.SerializerMethodField()
     order_status = serializers.SerializerMethodField()
-    order_type = serializers.CharField()
+    order_type = serializers.SerializerMethodField()
     user_id = serializers.CharField()
     wallet_tx_id = serializers.SerializerMethodField()
     parent_stock_tx_id = serializers.SerializerMethodField()
@@ -142,6 +143,10 @@ class JMeterStockTransactionSerializer(serializers.ModelSerializer):
             price_str = price_str.rstrip('0').rstrip('.')
         return price_str
 
+    def get_order_type(self, obj):
+        """Return the order type in uppercase for JMeter compatibility"""
+        return obj.order_type.upper() if obj.order_type else "UNKNOWN"
+
     def get_order_status(self, obj):
         """Return the order status in uppercase for JMeter compatibility"""
         # Map status values to the expected format
@@ -151,7 +156,8 @@ class JMeterStockTransactionSerializer(serializers.ModelSerializer):
         # Handle special cases for status formatting
         status_map = {
             "InProgress": "IN_PROGRESS",
-            "Partially_complete": "PARTIALLY_COMPLETE"
+            "Partially_complete": "PARTIALLY_COMPLETE",
+            "Pending": "IN_PROGRESS"  # Map Pending to IN_PROGRESS
         }
         
         # If we have a specific mapping, use it
@@ -163,8 +169,13 @@ class JMeterStockTransactionSerializer(serializers.ModelSerializer):
 
     def get_wallet_tx_id(self, obj):
         """Return the wallet transaction ID if available"""
-        if obj.wallet_transaction:
+        if hasattr(obj, 'wallet_transaction') and obj.wallet_transaction:
             return obj.wallet_transaction.id
+        elif hasattr(obj, 'wallet_transactions'):
+            # Try to get the first wallet transaction from the related set
+            wallet_tx = obj.wallet_transactions.first()
+            if wallet_tx:
+                return wallet_tx.id
         return None
 
     def get_parent_stock_tx_id(self, obj):
@@ -175,6 +186,7 @@ class JMeterStockTransactionSerializer(serializers.ModelSerializer):
 
 class WalletTransactionSerializer(serializers.ModelSerializer):
     stock_symbol = serializers.CharField(source='stock.symbol', read_only=True, allow_null=True)
+    stock_transaction_id = serializers.SerializerMethodField()
     amount = PriceField(max_digits=12, decimal_places=2)
     
     class Meta:
@@ -184,12 +196,20 @@ class WalletTransactionSerializer(serializers.ModelSerializer):
             'is_debit', 'amount', 'description', 'timestamp'
         ]
         read_only_fields = ['id', 'timestamp']
+        
+    def get_stock_transaction_id(self, obj):
+        """Get the stock transaction ID from either relationship field"""
+        if hasattr(obj, 'stock_transaction') and obj.stock_transaction:
+            return obj.stock_transaction.id
+        elif hasattr(obj, 'related_stock_tx') and obj.related_stock_tx:
+            return obj.related_stock_tx.id
+        return None
 
 # JMeter specific wallet transaction serializer
 class JMeterWalletTransactionSerializer(serializers.ModelSerializer):
     """Custom serializer for wallet transactions that formats data for JMeter compatibility"""
     wallet_tx_id = serializers.IntegerField(source='id')
-    stock_tx_id = serializers.IntegerField(source='stock_transaction_id', allow_null=True)
+    stock_tx_id = serializers.SerializerMethodField()
     stock_id = serializers.IntegerField(source='stock.id', allow_null=True)
     stock_symbol = serializers.CharField(source='stock.symbol', read_only=True, allow_null=True)
     amount = PriceField(max_digits=12, decimal_places=2)
@@ -201,6 +221,14 @@ class JMeterWalletTransactionSerializer(serializers.ModelSerializer):
             'wallet_tx_id', 'stock_tx_id', 'user_id', 'stock_id', 'stock_symbol',
             'is_debit', 'amount', 'description', 'timestamp'
         ]
+        
+    def get_stock_tx_id(self, obj):
+        """Get the stock transaction ID from the relationship"""
+        if hasattr(obj, 'stock_transaction') and obj.stock_transaction:
+            return obj.stock_transaction.id
+        elif hasattr(obj, 'related_stock_tx') and obj.related_stock_tx:
+            return obj.related_stock_tx.id
+        return None
 
 # Serializers for specific API responses
 

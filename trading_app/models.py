@@ -72,7 +72,7 @@ class StockTransaction(models.Model):
     price = models.DecimalField(max_digits=10, decimal_places=2)
     timestamp = models.DateTimeField(auto_now_add=True)
     parent_transaction = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='child_transactions')
-    wallet_transaction = models.ForeignKey('WalletTransaction', on_delete=models.SET_NULL, null=True, blank=True, related_name='stock_transactions')
+    wallet_transaction = models.OneToOneField('WalletTransaction', on_delete=models.SET_NULL, null=True, blank=True, related_name='related_stock_tx')
     external_order_id = models.BigIntegerField(null=True, blank=True, db_index=True, help_text="ID of the order in the matching engine")
     
     class Meta:
@@ -90,7 +90,7 @@ class WalletTransaction(models.Model):
     """Model for wallet transactions (deposits, withdrawals, stock purchases, stock sales)"""
     user_id = models.IntegerField()
     stock = models.ForeignKey(Stock, on_delete=models.SET_NULL, null=True, blank=True, related_name='wallet_transactions')
-    stock_transaction_id = models.IntegerField(null=True, blank=True)
+    stock_transaction = models.ForeignKey('StockTransaction', on_delete=models.SET_NULL, null=True, blank=True, related_name='wallet_transactions', db_column='stock_transaction_id')
     is_debit = models.BooleanField()  # True for deductions (buy stock), False for additions (add money, sell stock)
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     description = models.CharField(max_length=255, blank=True)
