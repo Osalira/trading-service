@@ -22,7 +22,9 @@ class RabbitMQClient:
         self.exchange_names = {
             'user_events': 'user_events',
             'order_events': 'order_events',
-            'system_events': 'system_events'
+            'system_events': 'system_events',
+            'wallet_events': 'wallet_events',
+            'portfolio_events': 'portfolio_events',
         }
         self.consumers = []
 
@@ -55,15 +57,22 @@ class RabbitMQClient:
                 self.connection = pika.BlockingConnection(parameters)
                 self.channel = self.connection.channel()
                 
-                # Declare exchanges
+                # Declare exchanges - include error handling for each exchange separately
                 for exchange_name in self.exchange_names.values():
-                    self.channel.exchange_declare(
-                        exchange=exchange_name,
-                        exchange_type='topic',
-                        durable=True
-                    )
+                    try:
+                        self.channel.exchange_declare(
+                            exchange=exchange_name,
+                            exchange_type='topic',
+                            durable=True
+                        )
+                        logger.debug(f"Declared exchange: {exchange_name}")
+                    except Exception as ex:
+                        logger.warning(f"Error declaring exchange {exchange_name}: {ex}")
+                        # If this is a critical error that closed the channel, we need to reconnect
+                        if not self.channel.is_open:
+                            raise Exception(f"Failed to declare exchange {exchange_name}: {ex}")
                 
-                logger.info(f"Successfully connected to RabbitMQ at {self.host}:{self.port}")
+                logger.info(f"Successfully connected to RabbitMQ at {self.host}:{self.port} and declared exchanges")
                 return
                 
             except Exception as e:
@@ -74,6 +83,13 @@ class RabbitMQClient:
                     logger.error(f"Maximum retries reached. Could not connect to RabbitMQ: {str(e)}")
                     raise
                 
+                # Close connection if it exists but is in a bad state
+                if self.connection and self.connection.is_open:
+                    try:
+                        self.connection.close()
+                    except:
+                        pass  # Ignore errors when closing
+                
                 # Wait before next retry with exponential backoff
                 time.sleep(2 ** retry_count)
 
@@ -82,6 +98,29 @@ class RabbitMQClient:
         try:
             if self.connection is None or not self.connection.is_open:
                 self.connect()
+            
+            # Get the exchange name, using the provided name if not in our mapping
+            actual_exchange = self.exchange_names.get(exchange, exchange)
+            
+            # Ensure exchange exists - declare it if it might not exist
+            try:
+                self.channel.exchange_declare(
+                    exchange=actual_exchange,
+                    exchange_type='topic',
+                    durable=True,
+                    passive=False  # Create if doesn't exist
+                )
+                logger.debug(f"Ensured exchange {actual_exchange} exists")
+            except Exception as ex:
+                logger.warning(f"Error declaring exchange {actual_exchange}: {ex}")
+                # Reconnect and try again if the channel was closed due to the error
+                if not self.channel.is_open:
+                    self.connect()
+                    self.channel.exchange_declare(
+                        exchange=actual_exchange,
+                        exchange_type='topic',
+                        durable=True
+                    )
             
             # Add timestamp if not present
             if 'timestamp' not in message:
@@ -96,7 +135,7 @@ class RabbitMQClient:
             
             # Publish message
             self.channel.basic_publish(
-                exchange=self.exchange_names.get(exchange, exchange),
+                exchange=actual_exchange,
                 routing_key=routing_key,
                 body=message_json,
                 properties=pika.BasicProperties(
@@ -105,7 +144,7 @@ class RabbitMQClient:
                 )
             )
             
-            logger.info(f"Published event to {exchange}.{routing_key}: {message.get('event_type', 'unknown')}")
+            logger.info(f"Published event to {actual_exchange}.{routing_key}: {message.get('event_type', 'unknown')}")
             
         except Exception as e:
             logger.error(f"Failed to publish event to {exchange}.{routing_key}: {str(e)}")
@@ -137,6 +176,29 @@ class RabbitMQClient:
                 try:
                     if self.connection is None or not self.connection.is_open:
                         self.connect()
+                    
+                    # Get the actual exchange name
+                    actual_exchange = self.exchange_names.get(exchange, exchange)
+                    
+                    # Make sure the exchange exists
+                    try:
+                        self.channel.exchange_declare(
+                            exchange=actual_exchange,
+                            exchange_type='topic',
+                            durable=True,
+                            passive=False  # Create if doesn't exist
+                        )
+                        logger.debug(f"Ensured exchange {actual_exchange} exists for consumer")
+                    except Exception as ex:
+                        logger.warning(f"Error declaring exchange {actual_exchange} for consumer: {ex}")
+                        # Reconnect and try again if the channel was closed
+                        if not self.channel.is_open:
+                            self.connect()
+                            self.channel.exchange_declare(
+                                exchange=actual_exchange,
+                                exchange_type='topic',
+                                durable=True
+                            )
                         
                     # Declare the queue
                     self.channel.queue_declare(
@@ -147,7 +209,7 @@ class RabbitMQClient:
                     # Bind the queue to each routing key
                     for routing_key in routing_keys:
                         self.channel.queue_bind(
-                            exchange=self.exchange_names.get(exchange, exchange),
+                            exchange=actual_exchange,
                             queue=queue_name,
                             routing_key=routing_key
                         )
@@ -171,7 +233,7 @@ class RabbitMQClient:
                         on_message_callback=on_message
                     )
                     
-                    logger.info(f"Started consumer for queue '{queue_name}' binding to {routing_keys}")
+                    logger.info(f"Started consumer for queue '{queue_name}' binding to {routing_keys} on exchange {actual_exchange}")
                     
                     # Start consuming (blocks until channel closed)
                     self.channel.start_consuming()

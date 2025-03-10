@@ -17,9 +17,10 @@ import os
 import uuid
 from django.utils import timezone
 from datetime import timedelta
+from django.db import connection
 import traceback
 
-from trading_app.models import Stock, UserPortfolio, Wallet, StockTransaction, WalletTransaction, OrderStatus
+from trading_app.models import Stock, UserPortfolio, Wallet, StockTransaction, WalletTransaction, OrderStatus, OrderType
 from serializers import (
     StockSerializer, UserPortfolioSerializer, WalletSerializer,
     StockTransactionSerializer, WalletTransactionSerializer,
@@ -105,141 +106,96 @@ def get_stock_prices(request):
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def get_stock_portfolio(request):
-    """Get the user's stock portfolio (open to any authenticated user)"""
-    # Check for specific user_id in query parameters
-    query_user_id = request.query_params.get('user_id')
-    if query_user_id:
-        logger.info(f"Using user_id {query_user_id} from query parameters")
-        user_id = query_user_id
+    user_id = get_user_id(request)
+    if not user_id:
+        return Response(
+            {"success": False, "data": {"error": "No user ID provided"}}, 
+            status=status.HTTP_200_OK  # Return 200 even for errors as required by JMeter
+        )
     
-        # Fall back to standard user_id extraction
-        user_id = get_user_id(request)
-    # Log all query parameters for debugging
+    logger.info(f"Getting stock portfolio for user {user_id}")
     
     try:
-        # Get the portfolio items
-        portfolio = UserPortfolio.objects.filter(user_id=user_id)
-        logger.info(f"User {user_id} portfolio has {len(portfolio)} stock items")
+        # Get all stocks owned by the user
+        portfolio = UserPortfolio.objects.filter(user_id=user_id).select_related('stock')
+        logger.info(f"User {user_id} portfolio has {portfolio.count()} stock items")
+        
+        # Log basic portfolio information
         for item in portfolio:
             logger.info(f"  Stock {item.stock_id} ({item.stock.symbol}): {item.quantity} shares at average price ${item.average_price}")
         
-        # Get ALL pending sell orders to exclude stocks that are being sold
-        # Using select_related to fetch stock information in a single query
+        # Find all pending sell orders for this user - we'll exclude these stocks from the portfolio
+        stocks_with_pending_sells = set()
+        pending_sell_quantity = {}
+        
+        # Get pending sell orders (status PENDING, PARTIAL, or IN_PROGRESS)
         pending_sell_orders = StockTransaction.objects.filter(
             user_id=user_id,
-            is_buy=False,  # sell orders
-            status__in=['Pending', 'InProgress', 'Partially_complete']  # Explicitly use string literals for SQL query
+            is_buy=False,  # sell orders only
+            status__in=[OrderStatus.PENDING, OrderStatus.PARTIALLY_COMPLETE, OrderStatus.IN_PROGRESS]  # any incomplete order status
         ).select_related('stock')
         
-        # Log the query and add debugging
-        query_str = str(pending_sell_orders.query)
-        logger.info(f"SQL Query for pending sell orders: {query_str}")
         logger.info(f"Found {pending_sell_orders.count()} pending sell orders for user {user_id}")
         
+        # Add stocks with pending sell orders to our exclusion set
         for order in pending_sell_orders:
-            logger.info(f"  Pending sell order: Stock {order.stock_id} ({order.stock.symbol}), Quantity: {order.quantity}, Status: {order.status}")
+            stock_id = int(order.stock_id)
+            stocks_with_pending_sells.add(stock_id)
+            pending_sell_quantity[stock_id] = pending_sell_quantity.get(stock_id, 0) + order.quantity
+            logger.info(f"  Found pending sell order: ID {order.id}, Stock {stock_id} ({order.stock.symbol}), Status: {order.status}, Quantity: {order.quantity}")
         
-        # Create a dictionary to track how many shares are pending sell for each stock
-        pending_sells_by_stock = {}
-        # Track transaction status for each stock
-        transaction_status_by_stock = {}
+        logger.info(f"Found {len(stocks_with_pending_sells)} stocks with pending sell orders for user {user_id}")
+        logger.info(f"Stocks to exclude: {stocks_with_pending_sells}")
         
-        for order in pending_sell_orders:
-            stock_id = order.stock_id
-            quantity = order.quantity
-            
-            # Track quantities
-            if stock_id in pending_sells_by_stock:
-                pending_sells_by_stock[stock_id] += quantity
-            else:
-                pending_sells_by_stock[stock_id] = quantity
-                
-            # Track transaction status (prioritize PARTIALLY_COMPLETE over IN_PROGRESS over PENDING)
-            if stock_id not in transaction_status_by_stock or order.status in [OrderStatus.PARTIALLY_COMPLETE, "Partially_complete"]:
-                transaction_status_by_stock[stock_id] = {
-                    'status': order.status,
-                    'transaction_id': order.id,
-                    'external_order_id': order.external_order_id
-                }
-        
-        logger.info(f"Found {len(pending_sells_by_stock)} stocks with pending sell orders for user {user_id}")
-        for stock_id, quantity in pending_sells_by_stock.items():
-            status_info = transaction_status_by_stock.get(stock_id, {}).get('status', 'Unknown')
-            logger.info(f"  Stock {stock_id}: {quantity} shares pending sell, status: {status_info}")
-        
-        # Filter portfolio items that still have available shares after pending sells
-        available_portfolio = []
-        
-        # Debug information about portfolio processing
-        logger.info("Processing portfolio items:")
+        # Process portfolio items to compute available quantity
+        portfolio_items = []
         for item in portfolio:
-            # Get quantity of this stock in pending sell orders
             stock_id = item.stock_id
-            pending_quantity = pending_sells_by_stock.get(stock_id, 0)
-            available_quantity = max(0, item.quantity - pending_quantity)
+            stock_id_int = int(stock_id)
             
-            # Get transaction status for this stock
-            transaction_info = transaction_status_by_stock.get(stock_id, {})
-            transaction_status = transaction_info.get('status')
-            transaction_id = transaction_info.get('transaction_id')
-            external_order_id = transaction_info.get('external_order_id')
+            # Skip stocks with pending sells - this is the key requirement
+            if stock_id_int in stocks_with_pending_sells:
+                logger.info(f"  EXCLUDING Stock {stock_id} ({item.stock.symbol}) from portfolio due to pending sell orders")
+                continue
             
-            logger.info(f"  Stock {stock_id} ({item.stock.symbol}): Total: {item.quantity}, Pending sell: {pending_quantity}, Available: {available_quantity}, Status: {transaction_status}")
+            # Calculate information for stocks that don't have pending sell orders
+            portfolio_item = {
+                'stock_id': str(item.stock_id),
+                'stock_name': item.stock.company_name if hasattr(item.stock, 'company_name') else item.stock.name,
+                'stock_symbol': item.stock.symbol,
+                'current_price': item.stock.current_price,
+                'average_price': item.average_price,
+                'quantity_owned': item.quantity,
+                'total_value': float(item.stock.current_price or 0) * item.quantity if item.stock.current_price else 0,
+                'profit_loss': 0,
+                'profit_loss_percentage': 0,
+                'available_quantity': item.quantity
+            }
             
-            # Only include stocks with available quantity > 0
-            if available_quantity > 0:
-                # Create a copy with adjusted quantity for serialization
-                item_copy = UserPortfolio(
-                    id=item.id,
-                    user_id=item.user_id,
-                    stock=item.stock,
-                    quantity=available_quantity,  # Use available quantity
-                    average_price=item.average_price,
-                    created_at=item.created_at,
-                    updated_at=item.updated_at
-                )
-                
-                # Add status information as attributes for the serializer to use
-                item_copy.has_pending_sells = pending_quantity > 0
-                item_copy.pending_sell_quantity = pending_quantity
-                item_copy.transaction_status = transaction_status
-                item_copy.transaction_id = transaction_id
-                item_copy.external_order_id = external_order_id
-                
-                available_portfolio.append(item_copy)
-                logger.info(f"    INCLUDED in portfolio with {available_quantity} available shares, status: {transaction_status}")
-            else:
-                logger.info(f"    EXCLUDED from portfolio (all {item.quantity} shares are pending sell, status: {transaction_status})")
+            # Calculate profit/loss if we have both prices
+            if item.average_price and item.stock.current_price:
+                portfolio_item['profit_loss'] = (item.stock.current_price - item.average_price) * item.quantity
+                if item.average_price > 0:
+                    portfolio_item['profit_loss_percentage'] = ((item.stock.current_price - item.average_price) / item.average_price) * 100
+            
+            portfolio_items.append(portfolio_item)
         
-        # Order items by company name (Z-A)
-        available_portfolio.sort(key=lambda item: item.stock.company_name, reverse=True)
+        # Sort portfolio items in reverse alphabetical order by stock_name (Z to A)
+        portfolio_items.sort(key=lambda item: item['stock_name'], reverse=True)
         
-        logger.info(f"Final available portfolio contains {len(available_portfolio)} stocks")
+        logger.info(f"Final available portfolio contains {len(portfolio_items)} stocks")
         
-        # Explicitly return empty array when no stocks are available
-        if not available_portfolio:
-            logger.info(f"User {user_id} has no available stocks due to pending sell orders - returning empty array")
-            return Response({'success': True, 'data': []})
-        
-        # Serialize the portfolio with status information
-        serializer = PortfolioResponseSerializer(available_portfolio, many=True, 
-                                             context={
-                                                 'pending_sells': pending_sells_by_stock,
-                                                 'transaction_status': transaction_status_by_stock
-                                             })
-        
-        # Log the final serialized output
-        logger.info(f"Serialized portfolio data: {serializer.data}")
-        
-        return Response({'success': True, 'data': serializer.data})
+        # Return the portfolio in JMeter format
+        return Response({"success": True, "data": portfolio_items})
+    
     except Exception as e:
-        logger.error(f"Error fetching portfolio for user {user_id}: {str(e)}")
-        import traceback
+        logger.error(f"Error fetching stock portfolio: {str(e)}")
         logger.error(traceback.format_exc())
         return Response(
-            {"success": False, "error": f"Failed to fetch portfolio: {str(e)}"}, 
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            {"success": False, "data": {"error": f"Internal error: {str(e)}"}}, 
+            status=status.HTTP_200_OK  # Return 200 even for errors as required by JMeter
         )
+
 
 @api_view(['GET'])
 @permission_classes([AllowAny])
@@ -255,7 +211,10 @@ def get_stock_transactions(request):
         # Get the user ID from the request
         user_id = get_user_id(request)
         if not user_id:
-            return Response({"error": "User ID is required"}, status=400)
+            return Response(
+                {"success": False, "data": {"error": "User ID is required"}}, 
+                status=status.HTTP_200_OK  # Return 200 even for errors as required by JMeter
+            )
         
         logger.debug(f"Fetching stock transactions for user ID: {user_id}")
         
@@ -267,35 +226,9 @@ def get_stock_transactions(request):
         transactions = StockTransaction.objects.filter(user_id=user_id).order_by('timestamp')
         
         # Use select_related to fetch related objects in one query
-        transactions = transactions.select_related('stock', 'wallet_transaction', 'parent_transaction')
+        transactions = transactions.select_related('stock')
         
         logger.debug(f"Found {transactions.count()} transactions")
-        
-        # Check for transactions with inconsistent wallet links (advanced diagnostics)
-        for tx in transactions:
-            if tx.wallet_transaction_id is not None:
-                # Verify wallet transaction exists and points back
-                try:
-                    wallet_tx = WalletTransaction.objects.get(id=tx.wallet_transaction_id)
-                    if wallet_tx.stock_transaction_id != tx.id:
-                        logger.warning(f"LINK INCONSISTENCY: Stock transaction {tx.id} points to wallet transaction {tx.wallet_transaction_id}, but wallet transaction points to stock transaction {wallet_tx.stock_transaction_id}")
-                except WalletTransaction.DoesNotExist:
-                    logger.warning(f"LINK INCONSISTENCY: Stock transaction {tx.id} points to non-existent wallet transaction {tx.wallet_transaction_id}")
-            
-            # Check if there's a wallet transaction pointing to this stock transaction
-            wallet_txs = WalletTransaction.objects.filter(stock_transaction_id=tx.id)
-            if wallet_txs.exists():
-                if tx.wallet_transaction_id is None:
-                    logger.warning(f"LINK INCONSISTENCY: Stock transaction {tx.id} has null wallet_transaction_id, but wallet transaction {wallet_txs.first().id} points to it")
-                elif tx.wallet_transaction_id != wallet_txs.first().id:
-                    logger.warning(f"LINK INCONSISTENCY: Stock transaction {tx.id} points to wallet transaction {tx.wallet_transaction_id}, but wallet transaction {wallet_txs.first().id} points to it")
-        
-        # Fix wallet transaction links for transactions with missing links
-        for tx in transactions:
-            if tx.wallet_transaction is None:
-                fixed = fix_missing_wallet_link(tx)
-                if fixed:
-                    logger.info(f"Fixed missing wallet link for stock transaction {tx.id}")
         
         # Apply pagination if needed
         if limit > 0:
@@ -303,19 +236,7 @@ def get_stock_transactions(request):
         
         # Log details of each transaction for debugging
         for tx in transactions:
-            logger.debug(f"Transaction {tx.id}: stock={tx.stock_id}, price={tx.price}, wallet_tx={tx.wallet_transaction.id if tx.wallet_transaction else None}")
-            
-            # Try to fix null wallet_tx_id field for JMeter serializer
-            if tx.wallet_transaction is None:
-                wallet_tx = WalletTransaction.objects.filter(stock_transaction=tx).first()
-                if wallet_tx:
-                    logger.info(f"Found wallet transaction {wallet_tx.id} for stock transaction {tx.id} via reverse lookup")
-            
-            if tx.order_type == 'MARKET' and tx.price == 0 and tx.wallet_transaction:
-                # For market orders with zero price but valid wallet transaction,
-                # log the actual price from the wallet transaction
-                if tx.quantity > 0:
-                    logger.debug(f"  Market order with wallet_tx amount={tx.wallet_transaction.amount}, calculated price={tx.wallet_transaction.amount/tx.quantity}")
+            logger.debug(f"Transaction {tx.id}: stock={tx.stock_id}, price={tx.price}")
         
         # Serialize the data using JMeter format
         serialized_data = JMeterStockTransactionSerializer(transactions, many=True).data
@@ -325,9 +246,11 @@ def get_stock_transactions(request):
     
     except Exception as e:
         logger.error(f"Error fetching stock transactions: {str(e)}")
-        import traceback
         logger.error(traceback.format_exc())
-        return Response({"success": False, "error": "Internal server error"}, status=500)
+        return Response(
+            {"success": False, "data": {"error": f"Internal error: {str(e)}"}}, 
+            status=status.HTTP_200_OK  # Return 200 even for errors as required by JMeter
+        )
 
 @api_view(['POST'])
 # @permission_classes([IsAuthenticated])
@@ -530,15 +453,14 @@ def get_wallet_balance(request):
         )
 
 @api_view(['GET'])
-# @permission_classes([IsAuthenticated])
-@permission_classes([AllowAny])
+@permission_classes([AllowAny])  # Use AllowAny for testing
 def get_wallet_transactions(request):
     """Get the user's wallet transaction history"""
     user_id = get_user_id(request)
     if not user_id:
         return Response(
-            {"success": False, "error": "User ID not provided"}, 
-            status=status.HTTP_400_BAD_REQUEST
+            {"success": False, "data": {"error": "User ID not provided"}}, 
+            status=status.HTTP_200_OK  # Return 200 even for errors as required by JMeter
         )
     
     try:
@@ -546,11 +468,19 @@ def get_wallet_transactions(request):
         limit = int(request.query_params.get('limit', 50))
         offset = int(request.query_params.get('offset', 0))
         
-        # Get all user's transactions but handle duplicates
+        # Get ONLY the requested user's transactions
+        # IMPORTANT: This is where we fix the bug - strictly filter by user_id
         all_transactions = WalletTransaction.objects.filter(user_id=user_id)
         
-        # Diagnostic: Check for inconsistent links with stock transactions
+        # NEW: Additional filtering to ensure data integrity
+        valid_transactions = []
+        invalid_reference_count = 0
+        cross_user_reference_count = 0
+        
+        # First pass: Check for invalid references and log warnings
         for tx in all_transactions:
+            is_valid = True
+            
             if tx.stock_transaction_id is not None:
                 # Check if the referenced stock transaction exists
                 try:
@@ -559,30 +489,27 @@ def get_wallet_transactions(request):
                     # Check if stock transaction belongs to the same user
                     if stock_tx.user_id != int(user_id):
                         logger.warning(f"CROSS-USER REFERENCE: Wallet transaction {tx.id} for user {user_id} references stock transaction {tx.stock_transaction_id} belonging to user {stock_tx.user_id}")
-                    
-                    # Check if stock transaction points back to this wallet transaction
-                    if stock_tx.wallet_transaction_id != tx.id:
-                        logger.warning(f"LINK INCONSISTENCY: Wallet transaction {tx.id} references stock transaction {tx.stock_transaction_id}, but stock transaction points to wallet transaction {stock_tx.wallet_transaction_id if stock_tx.wallet_transaction else None}")
-                        
-                        # Try to find a better matching stock transaction for this user
-                        matching_stock_tx = StockTransaction.objects.filter(
-                            user_id=user_id,
-                            stock_id=tx.stock_id,
-                            wallet_transaction__isnull=True
-                        ).order_by('timestamp').first()
-                        
-                        if matching_stock_tx:
-                            logger.info(f"Found potential match: Stock transaction {matching_stock_tx.id} for the same user {user_id}")
-                        
+                        cross_user_reference_count += 1
+                        # Mark as invalid - we don't want to show cross-user references
+                        is_valid = False
                 except StockTransaction.DoesNotExist:
                     logger.warning(f"INVALID REFERENCE: Wallet transaction {tx.id} references non-existent stock transaction {tx.stock_transaction_id}")
+                    invalid_reference_count += 1
+                    # Don't show transactions with references to non-existent entities
+                    is_valid = False
+            
+            if is_valid:
+                valid_transactions.append(tx)
+        
+        logger.info(f"Filtered out {cross_user_reference_count} cross-user references and {invalid_reference_count} invalid references")
+        all_transactions = valid_transactions
         
         # Process transactions to handle potential duplicates where stock_transaction is null
         # First, collect all transactions with non-null stock_transaction
-        transactions_with_stock_tx = list(all_transactions.exclude(stock_transaction__isnull=True))
+        transactions_with_stock_tx = [tx for tx in all_transactions if tx.stock_transaction_id is not None]
         
         # Now collect all transactions with null stock_transaction
-        transactions_with_null_stock_tx = list(all_transactions.filter(stock_transaction__isnull=True))
+        transactions_with_null_stock_tx = [tx for tx in all_transactions if tx.stock_transaction_id is None]
         
         # Create a dictionary to track duplicates by key attributes + timestamp window
         # We'll use a window of 2 seconds to consider transactions as potential duplicates
@@ -591,10 +518,7 @@ def get_wallet_transactions(request):
         # First, group the transactions with non-null stock_tx_id
         for tx in transactions_with_stock_tx:
             # Create a more unique key based on user, type, amount, stock, and stock_transaction
-            if tx.stock_transaction:
-                base_key = f"{tx.user_id}_{tx.is_debit}_{tx.amount}_{tx.stock_id if tx.stock_id else 'None'}_{tx.stock_transaction.id}"
-            else:
-                base_key = f"{tx.user_id}_{tx.is_debit}_{tx.amount}_{tx.stock_id if tx.stock_id else 'None'}_no_stock_tx"
+            base_key = f"{tx.user_id}_{tx.is_debit}_{tx.amount}_{tx.stock_id if tx.stock_id else 'None'}_{tx.stock_transaction_id}"
             
             # Only add this transaction as a candidate if it doesn't exist yet
             if base_key not in tx_groups:
@@ -634,7 +558,7 @@ def get_wallet_transactions(request):
         final_transactions.sort(key=lambda x: x.timestamp, reverse=True)
         transactions = final_transactions[offset:offset+limit]
         
-        logger.info(f"Fetched {len(transactions)} wallet transactions for user {user_id} after filtering {len(duplicate_ids)} duplicates")
+        logger.info(f"Fetched {len(transactions)} wallet transactions for user {user_id} after filtering {len(duplicate_ids)} duplicates, {cross_user_reference_count} cross-user references, and {invalid_reference_count} invalid references")
         
         # Check if JMeter format is requested (default to true for compatibility)
         use_jmeter_format = request.query_params.get('jmeter_format', 'true').lower() == 'true'
@@ -661,8 +585,8 @@ def get_wallet_transactions(request):
         logger.error(f"Error getting wallet transactions: {str(e)}")
         logger.error(traceback.format_exc())
         return Response(
-            {"success": False, "error": str(e)}, 
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            {"success": False, "data": {"error": f"Internal error: {str(e)}"}}, 
+            status=status.HTTP_200_OK  # Return 200 even for errors as required by JMeter
         )
 
 # Setup endpoints
@@ -958,8 +882,7 @@ def process_transaction(request):
                             quantity=order_quantity,
                             price=price,
                             parent_transaction=order,  # Link to parent transaction
-                            external_order_id=sell_order_id if sell_order_id else None,
-                            wallet_transaction=None  # Explicitly set to None - will be linked properly in process_transaction
+                            external_order_id=sell_order_id if sell_order_id else None
                         )
                         
                         logger.info(f"[TraceID: {trace_id}] Created child transaction {child_transaction.id} for partially filled sell order {order.id}, quantity: {order_quantity}")
@@ -1011,56 +934,29 @@ def process_transaction(request):
                         seller_wallet.save()
                         seller_wallet.refresh_from_db()
                         
-                        # Check if a wallet transaction already exists for this stock transaction
-                        existing_wallet_tx = WalletTransaction.objects.filter(
-                            stock_transaction=transaction_for_wallet,
+                        # Create a simple wallet transaction for the seller without complex linking logic
+                        seller_wallet_tx = WalletTransaction.objects.create(
                             user_id=sell_user_id,
-                            is_debit=False
-                        ).first()
+                            stock=stock,
+                            is_debit=False,  # Credit (adding money)
+                            amount=Decimal(str(price)) * Decimal(str(order_quantity)),
+                            description=f"Sale of {order_quantity} {stock.symbol} shares at ${price}"
+                        )
+                        logger.info(f"[TraceID: {trace_id}] Created wallet transaction {seller_wallet_tx.id} for seller {sell_user_id}")
                         
-                        if existing_wallet_tx:
-                            logger.info(f"[TraceID: {trace_id}] Found existing wallet transaction {existing_wallet_tx.id} for sell order, using it")
-                            seller_wallet_tx = existing_wallet_tx
+                        # Link wallet transaction to the stock transaction
+                        transaction_for_wallet = child_transaction if 'child_transaction' in locals() else order
+                        
+                        # Only link if the transaction belongs to the same user
+                        if transaction_for_wallet.user_id == int(sell_user_id):
+                            try:
+                                seller_wallet_tx.stock_transaction = transaction_for_wallet
+                                seller_wallet_tx.save(update_fields=['stock_transaction'])
+                                logger.info(f"[TraceID: {trace_id}] Linked seller wallet TX {seller_wallet_tx.id} to stock TX {transaction_for_wallet.id}")
+                            except Exception as link_error:
+                                logger.error(f"[TraceID: {trace_id}] Error linking seller transactions: {str(link_error)}")
                         else:
-                            # If we don't have a valid transaction_for_wallet, try harder to find it
-                            if not transaction_for_wallet and sell_order_id:
-                                # Try again with a wider search
-                                all_possible_sell_orders = StockTransaction.objects.filter(
-                                    Q(external_order_id=sell_order_id) | 
-                                    Q(user_id=sell_user_id, stock_id=stock_id, is_buy=False, status__in=[OrderStatus.PENDING, OrderStatus.PARTIALLY_COMPLETE])
-                                ).order_by('-timestamp')
-                                
-                                if all_possible_sell_orders.exists():
-                                    transaction_for_wallet = all_possible_sell_orders.first()
-                                    logger.info(f"[TraceID: {trace_id}] Found sell order {transaction_for_wallet.id} in wider search")
-                                    
-                                    # Check again for wallet transaction
-                                    existing_wallet_tx = WalletTransaction.objects.filter(
-                                        stock_transaction=transaction_for_wallet,
-                                        user_id=sell_user_id,
-                                        is_debit=False
-                                    ).first()
-                                    
-                                    if existing_wallet_tx:
-                                        logger.info(f"[TraceID: {trace_id}] Found existing wallet transaction {existing_wallet_tx.id} for sell order in wider search")
-                                        seller_wallet_tx = existing_wallet_tx
-                            
-                            # Create wallet transaction if we didn't find an existing one
-                            if not existing_wallet_tx:
-                                # Create wallet transaction record first without the stock_transaction relation
-                                seller_wallet_tx = WalletTransaction.objects.create(
-                                    user_id=sell_user_id,
-                                    stock=stock,
-                                    is_debit=False,  # Credit (adding money)
-                                    amount=Decimal(str(price)) * Decimal(str(quantity)),
-                                    description=f"Sale of {quantity} {stock.symbol} shares at ${price}",
-                                    stock_transaction=None  # Explicitly set to null initially to avoid circular linking issues
-                                )
-                                logger.info(f"[TraceID: {trace_id}] Created wallet transaction {seller_wallet_tx.id} for seller")
-                                
-                                # Use the utility function to ensure consistent bidirectional links
-                                transaction_for_wallet, seller_wallet_tx = ensure_consistent_transaction_links(transaction_for_wallet, seller_wallet_tx)
-                                logger.info(f"[TraceID: {trace_id}] Established bidirectional link between stock TX {transaction_for_wallet.id} and wallet TX {seller_wallet_tx.id}")
+                            logger.warning(f"[TraceID: {trace_id}] Prevented cross-user reference: wallet transaction for user {sell_user_id} tried to link to stock transaction {transaction_for_wallet.id} belonging to user {transaction_for_wallet.user_id}")
                         
                         logger.info(f"[TraceID: {trace_id}] Updated seller wallet: {sell_user_id}, old balance: {old_balance}, new balance: {seller_wallet.balance}, amount added: {transaction_amount}")
                         
@@ -1076,10 +972,6 @@ def process_transaction(request):
                             'stock_symbol': stock.symbol,
                             'trace_id': trace_id
                         }
-                        
-                        # Only add order_id if we have a valid sell_order_for_wallet
-                        if transaction_for_wallet:
-                            wallet_event_data['order_id'] = transaction_for_wallet.id
                         
                         publish_event('wallet_events', 'wallet.updated', wallet_event_data)
                         
@@ -1155,8 +1047,7 @@ def process_transaction(request):
                             quantity=quantity,
                             price=price,
                             parent_transaction=buy_order,
-                            external_order_id=buy_order_id,
-                            wallet_transaction=None  # Explicitly set to None - will be linked properly in process_transaction
+                            external_order_id=buy_order_id
                         )
                         
                         logger.info(f"[TraceID: {trace_id}] Created child buy transaction {child_buy_transaction.id} for partially filled buy order {buy_order.id}, quantity: {quantity}")
@@ -1309,65 +1200,141 @@ def process_transaction(request):
                                 logger.info(f"[TraceID: {trace_id}] Found existing wallet transaction {existing_wallet_tx.id} for buy order in wider search")
                                 buyer_wallet_tx = existing_wallet_tx
                     
-                    # Create wallet transaction if we didn't find an existing one
+                    # SIMPLIFIED: Create a new wallet transaction record without complex bidirectional linking
                     if not existing_wallet_tx:
-                        # Create wallet transaction record
+                        # Create a simpler wallet transaction record without complex bidirectional linking
                         buyer_wallet_tx = WalletTransaction.objects.create(
                             user_id=buy_user_id,
                             stock=stock,
                             is_debit=True,  # Debit for buy orders
                             amount=transaction_amount,
-                            description=f"Purchase of {quantity} {stock.symbol} shares at ${price}",
-                            stock_transaction=None  # Explicitly set to null initially to avoid circular linking issues
+                            description=f"Purchase of {quantity} {stock.symbol} shares at ${price}"
                         )
-                        logger.info(f"[TraceID: {trace_id}] Created wallet transaction {buyer_wallet_tx.id} for buyer")
-                
-                # If we found a buy order, link the wallet transaction to it
-                if buy_order_for_wallet:
-                    # Use the utility function to ensure consistent bidirectional links
-                    buy_order_for_wallet, buyer_wallet_tx = ensure_consistent_transaction_links(buy_order_for_wallet, buyer_wallet_tx)
+                        logger.info(f"[TraceID: {trace_id}] Created wallet transaction {buyer_wallet_tx.id} for buyer {buy_user_id}")
+                        
+                        # Find the correct stock transaction for this user
+                        correct_stock_tx = StockTransaction.objects.filter(
+                            user_id=buy_user_id,
+                            stock_id=stock_id,
+                            is_buy=True,
+                            quantity=quantity
+                        ).order_by('-timestamp').first()
+                        
+                        if correct_stock_tx:
+                            # With the new model, we only need to set the stock_transaction on wallet_transaction
+                            # The foreign key and constraint will ensure it's valid
+                            buyer_wallet_tx.stock_transaction = correct_stock_tx
+                            buyer_wallet_tx.save(update_fields=['stock_transaction'])
+                            logger.info(f"[TraceID: {trace_id}] Linked buyer wallet TX {buyer_wallet_tx.id} to stock TX {correct_stock_tx.id}")
+                            
+                            # Use this as the buy_order_for_wallet for further processing
+                            buy_order_for_wallet = correct_stock_tx
+                        else:
+                            logger.warning(f"[TraceID: {trace_id}] Could not find matching stock transaction for buyer {buy_user_id}")
+                            
+                            # If no existing stock transaction was found, create one
+                            # ENHANCED DUPLICATE DETECTION: Check for any similar transactions in the last 5 seconds
+                            existing_buy_tx = StockTransaction.objects.filter(
+                                user_id=buy_user_id,
+                                stock_id=stock_id,
+                                is_buy=True,
+                                quantity=quantity,
+                                price=price,
+                                timestamp__gte=timezone.now() - timezone.timedelta(seconds=5)
+                            ).first()
+                            
+                            if existing_buy_tx:
+                                logger.info(f"[TraceID: {trace_id}] Found recent matching buy transaction: {existing_buy_tx.id} for user {buy_user_id} within last 5 seconds, using it instead of creating new")
+                                # Use the existing transaction instead of creating a new one
+                                new_stock_tx = existing_buy_tx
+                                buy_order_for_wallet = existing_buy_tx
+                                
+                                # Check if this transaction already has a wallet transaction
+                                existing_wallet_tx = WalletTransaction.objects.filter(
+                                    stock_transaction=existing_buy_tx
+                                ).first()
+                                
+                                if existing_wallet_tx:
+                                    logger.info(f"[TraceID: {trace_id}] This transaction already has a wallet transaction {existing_wallet_tx.id}, skipping wallet creation")
+                                    buyer_wallet_tx = existing_wallet_tx
+                                else:
+                                    # Link the wallet transaction to the existing stock transaction
+                                    buyer_wallet_tx.stock_transaction = existing_buy_tx
+                                    buyer_wallet_tx.save(update_fields=['stock_transaction'])
+                                    logger.info(f"[TraceID: {trace_id}] Linked wallet transaction {buyer_wallet_tx.id} to existing stock transaction {existing_buy_tx.id}")
+                            
+                            elif not StockTransaction.objects.filter(
+                                user_id=buy_user_id,
+                                stock_id=stock_id,
+                                is_buy=True,
+                                quantity=quantity,
+                                status=OrderStatus.COMPLETED,
+                                timestamp__gte=timezone.now() - timezone.timedelta(seconds=10)
+                            ).exists():
+                                logger.info(f"[TraceID: {trace_id}] Creating new stock transaction record for buyer {buy_user_id}")
+                                # Create a new stock transaction for this purchase
+                                new_stock_tx = StockTransaction.objects.create(
+                                    user_id=buy_user_id,
+                                    stock=stock,
+                                    is_buy=True,
+                                    order_type=OrderType.MARKET,  # Default to MARKET for match notifications
+                                    status=OrderStatus.COMPLETED,
+                                    quantity=quantity,
+                                    price=price,
+                                    external_order_id=buy_order_id
+                                )
+                                # Now link them bidirectionally
+                                buyer_wallet_tx.stock_transaction = new_stock_tx
+                                buyer_wallet_tx.save(update_fields=['stock_transaction'])
+                                
+                                logger.info(f"[TraceID: {trace_id}] Created and linked new stock transaction {new_stock_tx.id} to wallet transaction {buyer_wallet_tx.id}")
+                                
+                                # Use this as the buy_order_for_wallet for event publishing
+                                buy_order_for_wallet = new_stock_tx
                     
-                    # Update the order status
-                    buy_order_for_wallet.status = OrderStatus.COMPLETED
-                    buy_order_for_wallet.save(update_fields=['status'])
-                    logger.info(f"[TraceID: {trace_id}] Updated stock transaction {buy_order_for_wallet.id} status to COMPLETED")
+                    # SIMPLIFIED: Separate the buy order status update from wallet transaction linking
+                    # If we found a buy order, update its status
+                    if buy_order_for_wallet:
+                        buy_order_for_wallet.status = OrderStatus.COMPLETED
+                        buy_order_for_wallet.save(update_fields=['status'])
+                        logger.info(f"[TraceID: {trace_id}] Updated stock transaction {buy_order_for_wallet.id} status to COMPLETED")
 
-                    # Publish order status change event - only if we have a buy_order_for_wallet
-                    publish_event('order_events', 'order.updated', {
-                        'event_type': 'order.updated',
-                        'order_id': buy_order_for_wallet.id,
-                        'external_order_id': buy_order_for_wallet.external_order_id,
-                        'user_id': buy_order_for_wallet.user_id,
-                        'stock_id': buy_order_for_wallet.stock_id,
-                        'stock_symbol': buy_order_for_wallet.stock.symbol,
-                        'order_type': 'buy',
-                        'previous_status': OrderStatus.PENDING,
-                        'new_status': OrderStatus.COMPLETED,
-                        'quantity': quantity,
-                        'price': str(buy_order_for_wallet.price),
+                        # Publish order status change event - only if we have a buy_order_for_wallet
+                        publish_event('order_events', 'order.updated', {
+                            'event_type': 'order.updated',
+                            'order_id': buy_order_for_wallet.id,
+                            'external_order_id': buy_order_for_wallet.external_order_id,
+                            'user_id': buy_order_for_wallet.user_id,
+                            'stock_id': buy_order_for_wallet.stock_id,
+                            'stock_symbol': buy_order_for_wallet.stock.symbol,
+                            'order_type': 'buy',
+                            'previous_status': OrderStatus.PENDING,
+                            'new_status': OrderStatus.COMPLETED,
+                            'quantity': quantity,
+                            'price': str(buy_order_for_wallet.price),
+                            'trace_id': trace_id
+                        })
+                    else:
+                        logger.warning(f"[TraceID: {trace_id}] No buy order found to link with wallet transaction {buyer_wallet_tx.id}")
+                    
+                    # Publish wallet update event
+                    wallet_event_data = {
+                        'event_type': 'wallet.updated',
+                        'user_id': buy_user_id,
+                        'previous_balance': str(old_balance),
+                        'new_balance': str(buyer_wallet.balance),
+                        'transaction_amount': str(transaction_amount),
+                        'transaction_type': 'debit',
+                        'stock_id': stock_id,
+                        'stock_symbol': stock.symbol,
                         'trace_id': trace_id
-                    })
-                else:
-                    logger.warning(f"[TraceID: {trace_id}] No buy order found to link with wallet transaction {buyer_wallet_tx.id}")
-                
-                # Publish wallet update event
-                wallet_event_data = {
-                    'event_type': 'wallet.updated',
-                    'user_id': buy_user_id,
-                    'previous_balance': str(old_balance),
-                    'new_balance': str(buyer_wallet.balance),
-                    'transaction_amount': str(transaction_amount),
-                    'transaction_type': 'debit',
-                    'stock_id': stock_id,
-                    'stock_symbol': stock.symbol,
-                    'trace_id': trace_id
-                }
-                
-                # Only add order_id if we have a valid buy_order_for_wallet
-                if buy_order_for_wallet:
-                    wallet_event_data['order_id'] = buy_order_for_wallet.id
-                
-                publish_event('wallet_events', 'wallet.updated', wallet_event_data)
+                    }
+                    
+                    # Only add order_id if we have a valid buy_order_for_wallet
+                    if buy_order_for_wallet:
+                        wallet_event_data['order_id'] = buy_order_for_wallet.id
+                    
+                    publish_event('wallet_events', 'wallet.updated', wallet_event_data)
             except Exception as e:
                 logger.error(f"[TraceID: {trace_id}] Error updating buyer portfolio or wallet: {str(e)}")
                 logger.error(traceback.format_exc())
@@ -1383,201 +1350,198 @@ def process_transaction(request):
             status=status.HTTP_200_OK
         )
 
-def process_order_notification(data, trace_id=None):
-    """Process a new order notification from the matching engine"""
-    if not trace_id:
-        trace_id = uuid.uuid4().hex[:8]
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def process_order_notification(request):
+    """Process order notifications from the order service"""
+    logger.info(f"Processing order notification")
+    
+    # Generate a trace ID for tracking this request
+    trace_id = request.headers.get('X-Request-ID', uuid.uuid4().hex[:8])
+    # Log the request data
+    logger.debug(f"Request data: {request.data}")
+    
+    # Map order service status to our internal status - use the exact values from OrderStatus in models.py
+    STATUS_MAP = {
+        'PENDING': OrderStatus.PENDING,            # 'Pending'
+        'COMPLETED': OrderStatus.COMPLETED,        # 'Completed'
+        'CANCELLED': OrderStatus.CANCELLED,        # 'Cancelled'
+        'PARTIAL': OrderStatus.PARTIALLY_COMPLETE, # 'Partially_complete'
+        'EXPIRED': OrderStatus.CANCELLED,          # 'Cancelled'
+        'FAILED': OrderStatus.REJECTED,            # 'Rejected'
+        'INPROGRESS': OrderStatus.IN_PROGRESS      # 'InProgress'
+    }
+    
+    try:
+        # Extract data from request
+        status = request.data.get('status', '').upper()
+        quantity = float(request.data.get('quantity', 0))
+        price = float(request.data.get('price', 0))
+        order_id = request.data.get('order_id')
+        stock_symbol = request.data.get('stock_symbol')
         
-    logger.info(f"[TraceID: {trace_id}] Processing order notification: {data}")
-    
-    user_id = data.get('user_id')
-    stock_id = data.get('stock_id')
-    order_type = data.get('order_type')  # This is 'Market' or 'Limit', not buy/sell
-    price = data.get('price')
-    quantity = data.get('quantity')
-    external_order_id = data.get('order_id')  # ID from matching engine
-    
-    # Get the buy/sell flag directly from the notification
-    is_buy = data.get('is_buy')
-    
-    # Get the limit type (Market or Limit) from the notification
-    # The matching engine sends this as order_type, not to be confused with buy/sell
-    limit_type = data.get('order_type', 'Limit')  # Get the order type (Market or Limit)
-    
-    # Get the status from the notification, default to PENDING if not provided
-    order_status = data.get('status', OrderStatus.PENDING)
-    
-    # Check if the order is completed or partially completed
-    if order_status in ["Completed", "Partially_complete"]:
-        # Map to the corresponding enum values
-        if order_status == "Completed":
-            order_status = OrderStatus.COMPLETED
+        # Check for both potential field names for order type with more robust handling
+        order_type = request.data.get('order_type') 
+        if not order_type:
+            # Try alternate field name
+            order_type = request.data.get('type')
+        
+        # Convert to proper format for OrderType model field
+        # The OrderType enum expects 'Market' or 'Limit' (not uppercase)
+        if order_type:
+            # First normalize to uppercase for comparison
+            order_type_upper = order_type.upper() if isinstance(order_type, str) else ''
+            
+            # Map to correct format for the model
+            if order_type_upper == 'MARKET':
+                order_type = OrderType.MARKET  # This is 'Market'
+            elif order_type_upper == 'LIMIT':
+                order_type = OrderType.LIMIT   # This is 'Limit'
+            else:
+                # Default to LIMIT if unrecognized
+                logger.warning(f"Unrecognized order type: {order_type}, defaulting to LIMIT")
+                order_type = OrderType.LIMIT
         else:
-            order_status = OrderStatus.PARTIALLY_COMPLETE
-    elif order_status == "Cancelled":
-        order_status = OrderStatus.CANCELLED
-    
-    logger.debug(f"[TraceID: {trace_id}] Parsed order details - is_buy: {is_buy}, limit_type: {limit_type}, status: {order_status}")
-    
-    if not all([user_id, stock_id, price, quantity, external_order_id]):
-        logger.error(f"[TraceID: {trace_id}] Missing required fields in order notification: {data}")
+            # Default if not provided
+            logger.warning(f"No order_type provided in request, defaulting to LIMIT")
+            order_type = OrderType.LIMIT
+            
+        user_id = request.data.get('user_id')
+        is_buy = request.data.get('is_buy', True)
         
-        # Publish error event
+        if status not in STATUS_MAP:
+            logger.warning(f"Received unknown status '{status}' from order service")
+            mapped_status = OrderStatus.PENDING  # Default to pending if unknown
+        else:
+            mapped_status = STATUS_MAP[status]
+        
+        logger.info(f"Mapped order status from '{status}' to '{mapped_status}'")
+        
+        # Require essential parameters
+        if not order_id or not stock_symbol:
+            return Response({"success": False, "error": "Missing required parameters"}, status=400)
+        
+        # Get the stock
+        stock = None
         try:
-            publish_event('system_events', 'system.error', {
-                'event_type': 'system.error',
-                'service': 'trading-service',
-                'operation': 'process_order_notification',
-                'error': 'Missing required fields in order notification',
-                'trace_id': trace_id,
-                'data': data
+            stock = Stock.objects.get(symbol=stock_symbol)
+            logger.info(f"Found stock {stock.symbol} with ID {stock.id}")
+        except Stock.DoesNotExist:
+            logger.warning(f"Stock {stock_symbol} not found, creating it")
+            stock = Stock.objects.create(
+                symbol=stock_symbol,
+                name=f"{stock_symbol} Stock",
+                current_price=price or 100.00  # Default price if none provided
+            )
+        
+        # Add quantity validation for buy orders
+        if mapped_status != OrderStatus.CANCELLED and is_buy and quantity <= 0:
+            return Response({
+                "success": False,
+                "error": "Invalid quantity for buy order"
+            }, status=400)
+        
+        # Check if we already have a transaction for this order
+        existing_tx = StockTransaction.objects.filter(external_order_id=order_id).first()
+        
+        if existing_tx:
+            logger.info(f"Found existing transaction for order {order_id}, updating status from {existing_tx.status} to {mapped_status}")
+            
+            # Update the existing transaction
+            existing_tx.status = mapped_status
+            existing_tx.price = price if price > 0 else existing_tx.price
+            existing_tx.quantity = quantity if quantity > 0 else existing_tx.quantity
+            existing_tx.save()
+            
+            # Process wallet for completed transactions
+            if mapped_status in [OrderStatus.COMPLETED, OrderStatus.PARTIALLY_COMPLETE]:
+                # Check if this stock transaction already has a wallet transaction
+                existing_wallet_tx = WalletTransaction.objects.filter(stock_transaction=existing_tx).exists()
+                
+                if existing_wallet_tx:
+                    logger.info(f"This transaction already has a wallet transaction, skipping wallet update")
+                else:
+                    # Only process if no wallet transaction exists yet
+                    process_stock_transaction(existing_tx, trace_id)
+            
+            return Response({
+                "success": True,
+                "message": f"Updated transaction status to {mapped_status}"
             })
-        except Exception as e:
-            logger.error(f"[TraceID: {trace_id}] Error publishing error event: {str(e)}")
-        
-        return Response(
-            {"success": False, "error": "Missing required fields in order notification"}, 
-            status=status.HTTP_200_OK  # Return 200 to avoid retries
-        )
-    
-    # Check if order already exists
-    existing_order = StockTransaction.objects.filter(
-        external_order_id=external_order_id
-    ).first()
-    
-    if existing_order:
-        logger.info(f"[TraceID: {trace_id}] Order with external ID {external_order_id} already exists, updating status")
-        
-        # Update the status if it's different
-        if existing_order.status != order_status:
-            old_status = existing_order.status
-            existing_order.status = order_status
-            existing_order.save()
+        else:
+            logger.info(f"Creating new transaction for order {order_id}")
             
-            logger.info(f"[TraceID: {trace_id}] Updated order {existing_order.id} status from {old_status} to {order_status}")
+            # Better duplicate detection - check for similar transactions in the last 5 seconds
+            recent_tx = StockTransaction.objects.filter(
+                user_id=user_id,
+                stock=stock,
+                is_buy=is_buy,
+                quantity=quantity,
+                price=price,
+                timestamp__gte=timezone.now() - timezone.timedelta(seconds=5)
+            ).first()
             
-            # Publish order status change event
+            if recent_tx:
+                logger.info(f"Found similar recent transaction {recent_tx.id} (within 5 seconds), updating it instead of creating new")
+                
+                # Update the existing similar transaction
+                recent_tx.external_order_id = order_id  # Add the external order ID
+                recent_tx.status = mapped_status
+                recent_tx.save()
+                
+                # Process wallet for completed transactions
+                if mapped_status in [OrderStatus.COMPLETED, OrderStatus.PARTIALLY_COMPLETE]:
+                    # Check if this stock transaction already has a wallet transaction
+                    existing_wallet_tx = WalletTransaction.objects.filter(stock_transaction=recent_tx).exists()
+                    
+                    if existing_wallet_tx:
+                        logger.info(f"This transaction already has a wallet transaction, skipping wallet update")
+                    else:
+                        # Only process if no wallet transaction exists yet
+                        process_stock_transaction(recent_tx, trace_id)
+                
+                return Response({
+                    "success": True,
+                    "message": f"Updated similar recent transaction {recent_tx.id} with order ID {order_id} and status {mapped_status}"
+                })
+            
+            # Create a new transaction
             try:
-                publish_event('order_events', 'order.updated', {
-                    'event_type': 'order.updated',
-                    'order_id': existing_order.id,
-                    'external_order_id': external_order_id,
-                    'user_id': existing_order.user_id,
-                    'stock_id': existing_order.stock_id,
-                    'stock_symbol': existing_order.stock.symbol if hasattr(existing_order, 'stock') and existing_order.stock else "Unknown",
-                    'order_type': 'buy' if existing_order.is_buy else 'sell',
-                    'previous_status': old_status,
-                    'new_status': order_status,
-                    'quantity': existing_order.quantity,
-                    'price': str(existing_order.price),
-                    'trace_id': trace_id
+                tx = StockTransaction.objects.create(
+                    user_id=user_id,
+                    stock=stock,
+                    is_buy=is_buy,
+                    order_type=order_type,
+                    status=mapped_status,
+                    quantity=quantity,
+                    price=price,
+                    external_order_id=order_id
+                )
+                
+                logger.info(f"Created transaction with ID {tx.id} for order {order_id}")
+                
+                # Process wallet for completed transactions
+                if mapped_status in [OrderStatus.COMPLETED, OrderStatus.PARTIALLY_COMPLETE]:
+                    process_stock_transaction(tx, trace_id)
+                
+                return Response({
+                    "success": True,
+                    "message": f"Created new transaction with status {mapped_status}"
                 })
             except Exception as e:
-                logger.error(f"[TraceID: {trace_id}] Error publishing order.updated event: {str(e)}")
-        
-        return Response({"success": True, "message": f"Order status updated to {order_status}"}, status=status.HTTP_200_OK)
-    
-    # Also check for recent transactions using the same user/stock/is_buy
-    from datetime import timedelta
-    
-    time_window = 5  # seconds
-    time_lower = timezone.now() - timedelta(seconds=time_window)
-    
-    similar_tx = StockTransaction.objects.filter(
-        user_id=user_id,
-        stock_id=stock_id,
-        is_buy=is_buy,
-        quantity=quantity,
-        price=price,
-        timestamp__gte=time_lower
-    ).first()
-    
-    if similar_tx:
-        logger.info(f"[TraceID: {trace_id}] Found a similar recent transaction (ID: {similar_tx.id}), updating it instead of creating new")
-        
-        # Update external_order_id if it was missing
-        if not similar_tx.external_order_id:
-            similar_tx.external_order_id = external_order_id
-        
-        # Update status if needed
-        if similar_tx.status != order_status:
-            old_status = similar_tx.status
-            similar_tx.status = order_status
-            similar_tx.save()
-            
-            logger.info(f"[TraceID: {trace_id}] Updated similar transaction {similar_tx.id} status from {old_status} to {order_status}")
-            
-        return Response({"success": True, "message": f"Updated similar recent transaction"}, status=status.HTTP_200_OK)
-        
-    # At this point we know we need to create a new transaction
-    try:
-        stock = Stock.objects.get(id=stock_id)
-    except Stock.DoesNotExist:
-        logger.error(f"[TraceID: {trace_id}] Stock with ID {stock_id} not found")
-        
-        # Publish error event
-        try:
-            publish_event('system_events', 'system.error', {
-                'event_type': 'system.error',
-                'service': 'trading-service',
-                'operation': 'process_order_notification',
-                'error': f"Stock with ID {stock_id} not found",
-                'trace_id': trace_id
-            })
-        except Exception as e:
-            logger.error(f"[TraceID: {trace_id}] Error publishing error event: {str(e)}")
-        
-        return Response(
-            {"success": False, "error": f"Stock with ID {stock_id} not found"}, 
-            status=status.HTTP_200_OK
-        )
-    
-    # Create the stock transaction
-    new_order = StockTransaction.objects.create(
-        user_id=user_id,
-        stock=stock,
-        is_buy=is_buy,
-        order_type=limit_type,
-        status=order_status,
-        quantity=quantity,
-        price=price,
-        external_order_id=external_order_id,
-        wallet_transaction=None  # Always ensure wallet_transaction is None when created
-    )
-    
-    logger.info(f"[TraceID: {trace_id}] Created new {limit_type.lower()} {'buy' if is_buy else 'sell'} order with ID {new_order.id}, external ID {external_order_id}, type {limit_type}, status {order_status}")
-    
-    # Publish order created event
-    try:
-        publish_event('order_events', 'order.created', {
-            'event_type': 'order.created',
-            'order_id': new_order.id,
-            'external_order_id': external_order_id,
-            'user_id': user_id,
-            'stock_id': stock_id,
-            'stock_symbol': stock.symbol,
-            'order_type': 'buy' if is_buy else 'sell',
-            'status': order_status,
-            'quantity': quantity,
-            'price': str(price),
-            'trace_id': trace_id
-        })
+                logger.error(f"Error creating transaction: {str(e)}")
+                logger.error(traceback.format_exc())
+                return Response({
+                    "success": False, 
+                    "data": {"error": f"Failed to create transaction: {str(e)}"}
+                }, status=status.HTTP_200_OK)  # Return 200 for JMeter
     except Exception as e:
-        logger.error(f"[TraceID: {trace_id}] Error publishing order.created event: {str(e)}")
-    
-    # Return early if this is a MARKET order with COMPLETED status 
-    # (portfolio/wallet updates will be handled by process_transaction)
-    if limit_type == "Market" and order_status == OrderStatus.COMPLETED:
-        logger.info(f"[TraceID: {trace_id}] MARKET order with COMPLETED status detected. Portfolio and wallet updates will be handled by process_transaction.")
-        logger.info(f"[TraceID: {trace_id}] NOT updating portfolio or creating wallet transaction in process_order_notification.")
-        return Response({"success": True, "message": "Order created", "order_id": new_order.id}, status=status.HTTP_200_OK)
-    
-    # For other order types and statuses, continue with regular processing
-    # Return response
-    return Response(
-        {"success": True, "message": "Order created", "order_id": new_order.id}, 
-        status=status.HTTP_200_OK
-    )
+        logger.error(f"Error processing order notification: {str(e)}")
+        logger.error(traceback.format_exc())
+        return Response({
+            "success": False,
+            "data": {"error": f"Internal error: {str(e)}"}
+        }, status=status.HTTP_200_OK)  # Return 200 for JMeter
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -1590,17 +1554,207 @@ def process_order_status(request):
     logger.info(f"Received order status notification: {request.data}")
     
     try:
+        # Extract the data from the request
+        data = request.data
+        
         # Generate a trace ID for tracking this request
         trace_id = request.headers.get('X-Request-ID', uuid.uuid4().hex[:8])
         
-        # Process the notification
-        result = process_order_notification(request.data, trace_id)
-        return result
+        # Extract data from request
+        status = data.get('status', '').upper()
+        quantity = float(data.get('quantity', 0))
+        price = float(data.get('price', 0))
+        order_id = data.get('order_id')
+        stock_id = data.get('stock_id')
+        stock_symbol = data.get('stock_symbol')
+        
+        # Check for both potential field names for order type with more robust handling
+        order_type = data.get('order_type') 
+        if not order_type:
+            # Try alternate field name
+            order_type = data.get('type')
+        
+        # Convert to proper format for OrderType model field
+        # The OrderType enum expects 'Market' or 'Limit' (not uppercase)
+        if order_type:
+            # First normalize to uppercase for comparison
+            order_type_upper = order_type.upper() if isinstance(order_type, str) else ''
+            
+            # Map to correct format for the model
+            if order_type_upper == 'MARKET':
+                order_type = OrderType.MARKET  # This is 'Market'
+            elif order_type_upper == 'LIMIT':
+                order_type = OrderType.LIMIT   # This is 'Limit'
+            else:
+                # Default to LIMIT if unrecognized
+                logger.warning(f"Unrecognized order type: {order_type}, defaulting to LIMIT")
+                order_type = OrderType.LIMIT
+        else:
+            # Default if not provided
+            logger.warning(f"No order_type provided in request, defaulting to LIMIT")
+            order_type = OrderType.LIMIT
+            
+        user_id = data.get('user_id')
+        is_buy = data.get('is_buy', True)
+        
+        # Validate required parameters
+        if not order_id:
+            return Response(
+                {"success": False, "data": {"error": "Missing required parameter: order_id"}}, 
+                status=status.HTTP_200_OK
+            )
+        
+        # Get the stock - either by ID or symbol
+        stock = None
+        try:
+            if stock_id:
+                # If stock_id is provided, use that to get the stock
+                stock = Stock.objects.get(id=stock_id)
+                logger.info(f"Found stock with ID {stock_id}: {stock.symbol} (ID: {stock.id})")
+            elif stock_symbol:
+                # If only stock_symbol is provided, look up by symbol
+                stock = Stock.objects.get(symbol=stock_symbol)
+                logger.info(f"Found stock with symbol {stock_symbol}: ID {stock.id}")
+            else:
+                # If neither is provided, return an error
+                return Response(
+                    {"success": False, "data": {"error": "Missing required parameter: stock_id or stock_symbol"}}, 
+                    status=status.HTTP_200_OK
+                )
+        except Stock.DoesNotExist:
+            # If stock doesn't exist and we have a symbol, create it
+            if stock_symbol:
+                logger.warning(f"Stock {stock_symbol} not found, creating it")
+                stock = Stock.objects.create(
+                    symbol=stock_symbol,
+                    name=f"{stock_symbol} Stock",
+                    current_price=price or 100.00  # Default price if none provided
+                )
+            else:
+                return Response(
+                    {"success": False, "data": {"error": f"Stock with ID {stock_id} not found and no symbol provided to create it"}}, 
+                    status=status.HTTP_200_OK
+                )
+        
+        # Map order service status to our internal status - use the exact values from OrderStatus in models.py
+        STATUS_MAP = {
+            'PENDING': OrderStatus.PENDING,            # 'Pending'
+            'COMPLETED': OrderStatus.COMPLETED,        # 'Completed'
+            'CANCELLED': OrderStatus.CANCELLED,        # 'Cancelled'
+            'PARTIAL': OrderStatus.PARTIALLY_COMPLETE, # 'Partially_complete'
+            'EXPIRED': OrderStatus.CANCELLED,          # 'Cancelled'
+            'FAILED': OrderStatus.REJECTED,            # 'Rejected'
+            'INPROGRESS': OrderStatus.IN_PROGRESS      # 'InProgress'
+        }
+        
+        if status not in STATUS_MAP:
+            logger.warning(f"Received unknown status '{status}' from order service")
+            mapped_status = OrderStatus.PENDING  # Default to pending if unknown
+        else:
+            mapped_status = STATUS_MAP[status]
+        
+        logger.info(f"Mapped order status from '{status}' to '{mapped_status}'")
+        
+        # Check if we already have a transaction for this order
+        existing_tx = StockTransaction.objects.filter(external_order_id=order_id).first()
+        
+        if existing_tx:
+            logger.info(f"Found existing transaction for order {order_id}, updating status from {existing_tx.status} to {mapped_status}")
+            
+            # Update the existing transaction
+            existing_tx.status = mapped_status
+            existing_tx.price = price if price > 0 else existing_tx.price
+            existing_tx.quantity = quantity if quantity > 0 else existing_tx.quantity
+            existing_tx.save()
+            
+            # Process wallets if the transaction is now completed
+            if mapped_status in [OrderStatus.COMPLETED, OrderStatus.PARTIALLY_COMPLETE]:
+                # Check if this stock transaction already has a wallet transaction
+                existing_wallet_tx = WalletTransaction.objects.filter(stock_transaction=existing_tx).exists()
+                
+                if existing_wallet_tx:
+                    logger.info(f"This transaction already has a wallet transaction, skipping wallet update")
+                else:
+                    # Only process if no wallet transaction exists yet
+                    process_stock_transaction(existing_tx, trace_id)
+            
+            return Response({
+                "success": True,
+                "message": f"Updated transaction status to {mapped_status}"
+            })
+        else:
+            logger.info(f"Creating new transaction for order {order_id}")
+            
+            # Better duplicate detection - check for similar transactions in the last 5 seconds
+            recent_tx = StockTransaction.objects.filter(
+                user_id=user_id,
+                stock=stock,
+                is_buy=is_buy,
+                quantity=quantity,
+                price=price,
+                timestamp__gte=timezone.now() - timezone.timedelta(seconds=5)
+            ).first()
+            
+            if recent_tx:
+                logger.info(f"Found similar recent transaction {recent_tx.id} (within 5 seconds), updating it instead of creating new")
+                
+                # Update the existing similar transaction
+                recent_tx.external_order_id = order_id  # Add the external order ID
+                recent_tx.status = mapped_status
+                recent_tx.save()
+                
+                # Process wallet for completed transactions
+                if mapped_status in [OrderStatus.COMPLETED, OrderStatus.PARTIALLY_COMPLETE]:
+                    # Check if this stock transaction already has a wallet transaction
+                    existing_wallet_tx = WalletTransaction.objects.filter(stock_transaction=recent_tx).exists()
+                    
+                    if existing_wallet_tx:
+                        logger.info(f"This transaction already has a wallet transaction, skipping wallet update")
+                    else:
+                        # Only process if no wallet transaction exists yet
+                        process_stock_transaction(recent_tx, trace_id)
+                
+                return Response({
+                    "success": True,
+                    "message": f"Updated similar recent transaction {recent_tx.id} with order ID {order_id} and status {mapped_status}"
+                })
+            
+            # Create a new transaction
+            try:
+                tx = StockTransaction.objects.create(
+                    user_id=user_id,
+                    stock=stock,
+                    is_buy=is_buy,
+                    order_type=order_type,
+                    status=mapped_status,
+                    quantity=quantity,
+                    price=price,
+                    external_order_id=order_id
+                )
+                
+                logger.info(f"Created transaction with ID {tx.id} for order {order_id}")
+                
+                # Process wallet for completed transactions
+                if mapped_status in [OrderStatus.COMPLETED, OrderStatus.PARTIALLY_COMPLETE]:
+                    process_stock_transaction(tx, trace_id)
+                
+                return Response({
+                    "success": True,
+                    "message": f"Created new transaction with status {mapped_status}"
+                })
+            except Exception as e:
+                logger.error(f"Error creating transaction: {str(e)}")
+                logger.error(traceback.format_exc())
+                return Response({
+                    "success": False, 
+                    "data": {"error": f"Failed to create transaction: {str(e)}"}
+                }, status=status.HTTP_200_OK)  # Return 200 for JMeter
     except Exception as e:
         logger.error(f"Error processing order status: {str(e)}")
+        logger.error(traceback.format_exc())
         return Response(
-            {"success": False, "data": {"success": False, "error": f"Error processing order status: {str(e)}"}}, 
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            {"success": False, "data": {"error": f"Error processing order status: {str(e)}"}}, 
+            status=status.HTTP_200_OK  # Return 200 for JMeter
         )
 
 @api_view(['POST'])
@@ -1648,454 +1802,143 @@ def update_stock_prices(request):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
-@api_view(['POST'])
-@permission_classes([AllowAny])
-def fix_transaction_links(request):
-    """Maintenance endpoint to fix links between stock and wallet transactions"""
+def process_stock_transaction(stock_tx, trace_id=None):
+    """Process a stock transaction and update wallet and portfolio accordingly
+    
+    This is a utility function that handles a StockTransaction object directly,
+    creating appropriate wallet transactions, and updating user portfolios.
+    It's called from process_transaction and process_order_notification.
+    """
+    if not trace_id:
+        trace_id = str(uuid.uuid4())[:8]
+    
+    logger.info(f"[TraceID: {trace_id}] Processing stock transaction {stock_tx.id}, status: {stock_tx.status}")
+    
     try:
-        # Get scope of fix - default to 'all'
-        scope = request.data.get('scope', 'all')
+        # Extract transaction details
+        user_id = stock_tx.user_id
+        stock = stock_tx.stock
+        is_buy = stock_tx.is_buy
+        quantity = stock_tx.quantity
+        price = stock_tx.price
         
-        # Track counts for reporting
-        fixed_count = 0
-        examined_count = 0
+        # Only process COMPLETED or PARTIAL transactions - using correct OrderStatus values
+        if stock_tx.status not in [OrderStatus.COMPLETED, OrderStatus.PARTIALLY_COMPLETE]:
+            logger.info(f"[TraceID: {trace_id}] Skipping transaction {stock_tx.id} with status {stock_tx.status}")
+            return
         
-        # Find stock transactions with null wallet_transaction but having a wallet transaction with stock_transaction reference
-        stock_txs_to_fix = StockTransaction.objects.filter(
-            wallet_transaction__isnull=True
+        # CRITICAL: Check if a wallet transaction already exists for this stock transaction
+        # This prevents duplicate wallet transactions from being created
+        existing_wallet_tx = WalletTransaction.objects.filter(stock_transaction=stock_tx).first()
+        if existing_wallet_tx:
+            logger.info(f"[TraceID: {trace_id}] Wallet transaction {existing_wallet_tx.id} already exists for stock transaction {stock_tx.id}, skipping")
+            return existing_wallet_tx
+        
+        # Get or create user wallet
+        wallet, created = Wallet.objects.get_or_create(
+            user_id=user_id,
+            defaults={'balance': 0}
         )
         
-        logger.info(f"Found {stock_txs_to_fix.count()} stock transactions with missing wallet_transaction links")
+        # Calculate transaction amount
+        amount = Decimal(quantity) * Decimal(price)
         
-        for stock_tx in stock_txs_to_fix:
-            examined_count += 1
+        # Create wallet transaction first before updating portfolio
+        # Different handling for buy vs sell
+        if is_buy:
+            # Buying stock - deduct from wallet
+            if wallet.balance < amount:
+                logger.warning(f"[TraceID: {trace_id}] Insufficient funds for transaction {stock_tx.id}: balance={wallet.balance}, amount={amount}")
+                # We'll still process it, but log the warning
             
-            # STEP 1: Look for wallet transaction with this stock_transaction reference
-            wallet_tx = WalletTransaction.objects.filter(stock_transaction=stock_tx).first()
+            # Update wallet balance
+            wallet.balance = F('balance') - amount
+            wallet.save()
+            wallet.refresh_from_db()
             
-            if wallet_tx:
-                # Create a bidirectional link - ensure both FK and FK ID are set
-                stock_tx.wallet_transaction = wallet_tx
-                stock_tx.save(update_fields=['wallet_transaction'])
-                
-                # Make sure stock_transaction_id is also set in wallet_tx
-                if not wallet_tx.stock_transaction_id or wallet_tx.stock_transaction_id != stock_tx.id:
-                    wallet_tx.stock_transaction_id = stock_tx.id
-                    wallet_tx.save(update_fields=['stock_transaction_id'])
-                    
-                fixed_count += 1
-                logger.info(f"Fixed link between stock tx {stock_tx.id} and wallet tx {wallet_tx.id}")
-                continue
-        
-        # STEP 2: Also find wallet transactions with null stock_transaction_id but linked from a stock transaction
-        wallet_txs_to_fix = WalletTransaction.objects.filter(
-            stock_transaction_id__isnull=True
-        )
-        
-        logger.info(f"Found {wallet_txs_to_fix.count()} wallet transactions with missing stock_transaction_id")
-        
-        for wallet_tx in wallet_txs_to_fix:
-            examined_count += 1
+            # Create wallet transaction record (debit)
+            wallet_tx = WalletTransaction.objects.create(
+                user_id=user_id,
+                stock=stock,
+                stock_transaction=stock_tx,  # Link to stock transaction
+                is_debit=True,  # Debit (money out)
+                amount=amount,
+                description=f"Purchase of {quantity} shares of {stock.symbol} at ${price}"
+            )
             
-            # Look for stock transaction that links to this wallet transaction
-            stock_tx = StockTransaction.objects.filter(wallet_transaction=wallet_tx).first()
+            logger.info(f"[TraceID: {trace_id}] Created wallet transaction {wallet_tx.id} for buy transaction {stock_tx.id}")
             
-            if stock_tx:
-                # Update the stock_transaction_id
-                wallet_tx.stock_transaction = stock_tx
-                wallet_tx.stock_transaction_id = stock_tx.id
-                wallet_tx.save(update_fields=['stock_transaction', 'stock_transaction_id'])
-                fixed_count += 1
-                logger.info(f"Fixed stock_transaction_id for wallet tx {wallet_tx.id} to {stock_tx.id}")
-        
-        # STEP 3: Find mismatched links (stock_tx.wallet_transaction points to wallet_tx1,
-        # but wallet_tx1.stock_transaction points to a different stock_tx2)
-        all_stock_txs_with_wallet = StockTransaction.objects.filter(
-            wallet_transaction__isnull=False
-        ).select_related('wallet_transaction')
-        
-        for stock_tx in all_stock_txs_with_wallet:
-            examined_count += 1
-            wallet_tx = stock_tx.wallet_transaction
+            # Update user portfolio - add to holdings
+            portfolio, created = UserPortfolio.objects.get_or_create(
+                user_id=user_id,
+                stock=stock,
+                defaults={
+                    'quantity': 0,
+                    'average_price': 0
+                }
+            )
             
-            # If the wallet transaction's stock_transaction doesn't point back to this stock_tx,
-            # we have a mismatch that needs to be fixed
-            if wallet_tx.stock_transaction_id != stock_tx.id:
-                logger.info(f"Found mismatched bidirectional link: Stock TX {stock_tx.id} points to Wallet TX {wallet_tx.id}, but Wallet TX points to Stock TX {wallet_tx.stock_transaction_id}")
-                
-                # Fix the link
-                wallet_tx.stock_transaction = stock_tx
-                wallet_tx.stock_transaction_id = stock_tx.id
-                wallet_tx.save(update_fields=['stock_transaction', 'stock_transaction_id'])
-                fixed_count += 1
-                logger.info(f"Fixed mismatched link: Wallet TX {wallet_tx.id} now properly points to Stock TX {stock_tx.id}")
-        
-        # STEP 4: Check the reverse direction as well
-        all_wallet_txs_with_stock = WalletTransaction.objects.filter(
-            stock_transaction__isnull=False
-        ).select_related('stock_transaction')
-        
-        for wallet_tx in all_wallet_txs_with_stock:
-            examined_count += 1
-            stock_tx = wallet_tx.stock_transaction
+            # Calculate new average price based on weighted average
+            if portfolio.quantity > 0 and portfolio.average_price:
+                total_value = (portfolio.quantity * portfolio.average_price) + amount
+                new_quantity = portfolio.quantity + quantity
+                new_avg_price = total_value / new_quantity if new_quantity > 0 else price
+            else:
+                new_avg_price = price
             
-            # If the stock transaction's wallet_transaction doesn't point back to this wallet_tx,
-            # we have a mismatch that needs to be fixed
-            if stock_tx.wallet_transaction_id != wallet_tx.id:
-                logger.info(f"Found mismatched bidirectional link: Wallet TX {wallet_tx.id} points to Stock TX {stock_tx.id}, but Stock TX points to Wallet TX {stock_tx.wallet_transaction_id}")
-                
-                # Fix the link
-                stock_tx.wallet_transaction = wallet_tx
-                stock_tx.save(update_fields=['wallet_transaction'])
-                fixed_count += 1
-                logger.info(f"Fixed mismatched link: Stock TX {stock_tx.id} now properly points to Wallet TX {wallet_tx.id}")
-        
-        # NEW STEP 5: Fix cross-user references (wallet transactions linked to another user's stock transactions)
-        all_wallet_txs = WalletTransaction.objects.filter(
-            stock_transaction_id__isnull=False
-        ).select_related('stock_transaction')
-        
-        logger.info(f"Checking {all_wallet_txs.count()} wallet transactions for cross-user references")
-        
-        for wallet_tx in all_wallet_txs:
-            examined_count += 1
-            stock_tx = wallet_tx.stock_transaction
+            # Update portfolio
+            portfolio.quantity = F('quantity') + quantity
+            portfolio.average_price = new_avg_price
+            portfolio.save()
             
-            # If the wallet transaction and stock transaction belong to different users,
-            # we likely have a cross-user reference issue
-            if wallet_tx.user_id != stock_tx.user_id:
-                logger.info(f"Found cross-user reference: Wallet TX {wallet_tx.id} (user {wallet_tx.user_id}) references Stock TX {stock_tx.id} (user {stock_tx.user_id})")
-                
-                # Look for a stock transaction belonging to the wallet's user that should be linked instead
-                correct_stock_tx = StockTransaction.objects.filter(
-                    user_id=wallet_tx.user_id,
-                    stock_id=stock_tx.stock_id,
-                    wallet_transaction__isnull=True,
-                    timestamp__range=(
-                        wallet_tx.timestamp - timedelta(seconds=60),
-                        wallet_tx.timestamp + timedelta(seconds=60)
-                    )
-                ).first()
-                
-                if correct_stock_tx:
-                    # Update both sides of the relationship
-                    wallet_tx.stock_transaction = correct_stock_tx
-                    wallet_tx.stock_transaction_id = correct_stock_tx.id
-                    wallet_tx.save(update_fields=['stock_transaction', 'stock_transaction_id'])
-                    
-                    correct_stock_tx.wallet_transaction = wallet_tx
-                    correct_stock_tx.save(update_fields=['wallet_transaction'])
-                    
-                    fixed_count += 1
-                    logger.info(f"Fixed cross-user reference: Wallet TX {wallet_tx.id} now properly linked to Stock TX {correct_stock_tx.id} (same user {wallet_tx.user_id})")
-                else:
-                    logger.warning(f"Could not find a matching stock transaction for user {wallet_tx.user_id} to replace cross-user reference")
-        
-        return Response({
-            "success": True, 
-            "message": f"Fixed {fixed_count} transaction links out of {examined_count} examined"
-        })
-        
-    except Exception as e:
-        logger.error(f"Error fixing transaction links: {str(e)}")
-        logger.error(traceback.format_exc())
-        return Response(
-            {"success": False, "error": str(e)}, 
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-
-def fix_missing_wallet_link(stock_tx):
-    """
-    Try to fix a missing wallet_transaction link for a stock transaction.
-    Returns True if a fix was applied.
-    """
-    if stock_tx.wallet_transaction is None:
-        # Method 1: Try to find wallet transaction by stock_transaction reverse relationship
-        wallet_tx = WalletTransaction.objects.filter(stock_transaction=stock_tx).first()
-        if wallet_tx:
-            # Use the utility function to ensure consistent bidirectional links
-            stock_tx, wallet_tx = ensure_consistent_transaction_links(stock_tx, wallet_tx)
-            logger.info(f"Fixed link between stock tx {stock_tx.id} and wallet tx {wallet_tx.id}")
-            return True
+            logger.info(f"[TraceID: {trace_id}] Updated portfolio for user {user_id}: added {quantity} shares of {stock.symbol}, new total: {portfolio.quantity + quantity}")
+        else:
+            # Selling stock - add to wallet
+            # Update wallet balance
+            wallet.balance = F('balance') + amount
+            wallet.save()
+            wallet.refresh_from_db()
             
-        # Method 2: Look for a match with the same external_order_id
-        if stock_tx.external_order_id:
-            matching_tx = StockTransaction.objects.filter(
-                external_order_id=stock_tx.external_order_id,
-                user_id=stock_tx.user_id, 
-                stock_id=stock_tx.stock_id,
-                wallet_transaction__isnull=False
-            ).exclude(id=stock_tx.id).first()
+            # Create wallet transaction record (credit)
+            wallet_tx = WalletTransaction.objects.create(
+                user_id=user_id,
+                stock=stock,
+                stock_transaction=stock_tx,  # Link to stock transaction
+                is_debit=False,  # Credit (money in)
+                amount=amount,
+                description=f"Sale of {quantity} shares of {stock.symbol} at ${price}"
+            )
             
-            if matching_tx and matching_tx.wallet_transaction:
-                # Get the wallet transaction from the matching stock transaction
-                wallet_tx = matching_tx.wallet_transaction
-                
-                # Use the utility function to create bidirectional links between stock_tx and wallet_tx
-                stock_tx, wallet_tx = ensure_consistent_transaction_links(stock_tx, wallet_tx)
-                logger.info(f"Fixed link for tx {stock_tx.id} using matching tx {matching_tx.id} with same external_order_id {stock_tx.external_order_id}")
-                return True
-                
-        # Method 3: Try matching by time proximity
-        return fix_transaction_link_by_time_proximity(stock_tx)
-                
-    return False
-
-def fix_transaction_link_by_time_proximity(stock_tx):
-    """
-    Try to fix a missing wallet_transaction link by finding matching wallet transactions
-    based on time proximity, user, and amount.
-    """
-    # Find transactions created within 1 second of this one for the same user/stock
-    from datetime import timedelta
-
-    time_window = 1  # seconds (more conservative)
-    time_lower = stock_tx.timestamp - timedelta(seconds=time_window)
-    time_upper = stock_tx.timestamp + timedelta(seconds=time_window)
-
-    # For buy orders, wallet amount should be negative (debit)
-    # For sell orders, wallet amount should be positive (credit)
-    expected_is_debit = stock_tx.is_buy
-
-    # Calculate the expected amount based on stock transaction
-    expected_amount = stock_tx.quantity * stock_tx.price
-
-    wallet_txs = WalletTransaction.objects.filter(
-        user_id=stock_tx.user_id,
-        timestamp__range=(time_lower, time_upper),
-        is_debit=expected_is_debit,
-        stock_transaction__isnull=True
-    ).order_by('timestamp')
-
-    # Find the closest match in time
-    closest_wallet_tx = None
-    smallest_time_diff = None
-
-    for wallet_tx in wallet_txs:
-        time_diff = abs((wallet_tx.timestamp - stock_tx.timestamp).total_seconds())
-        amount_diff_percent = abs(abs(float(wallet_tx.amount)) - expected_amount) / expected_amount * 100 if expected_amount > 0 else 0
-        
-        # Only consider it if amount is reasonably close (within 5%)
-        if amount_diff_percent <= 5:
-            if smallest_time_diff is None or time_diff < smallest_time_diff:
-                smallest_time_diff = time_diff
-                closest_wallet_tx = wallet_tx
-
-    if closest_wallet_tx:
-        # Use the utility function to create bidirectional links
-        stock_tx, closest_wallet_tx = ensure_consistent_transaction_links(stock_tx, closest_wallet_tx)
-        logger.info(f"Fixed link between stock tx {stock_tx.id} and wallet tx {closest_wallet_tx.id} based on time proximity")
-        return True
-        
-    return False
-
-@api_view(['GET'])
-@permission_classes([AllowAny])
-def diagnose_transactions(request):
-    """Diagnostic endpoint to examine transaction links"""
-    try:
-        # Get user ID and transaction IDs from the query parameters
-        user_id = request.query_params.get('user_id')
-        stock_tx_id = request.query_params.get('stock_tx_id')
-        wallet_tx_id = request.query_params.get('wallet_tx_id')
-        
-        response_data = {
-            "success": True,
-            "diagnostics": {},
-            "recommendations": []
-        }
-        
-        # If we have a user ID, check all transactions for that user
-        if user_id:
-            stock_txs = StockTransaction.objects.filter(user_id=user_id).order_by('id')
-            wallet_txs = WalletTransaction.objects.filter(user_id=user_id).order_by('id')
+            logger.info(f"[TraceID: {trace_id}] Created wallet transaction {wallet_tx.id} for sell transaction {stock_tx.id}")
             
-            response_data["diagnostics"]["user_info"] = {
-                "user_id": user_id,
-                "stock_transaction_count": stock_txs.count(),
-                "wallet_transaction_count": wallet_txs.count()
-            }
-            
-            # Include basic info about all stock transactions
-            response_data["diagnostics"]["stock_transactions"] = [{
-                "id": tx.id,
-                "stock_id": tx.stock_id,
-                "is_buy": tx.is_buy,
-                "status": tx.status,
-                "quantity": tx.quantity,
-                "price": str(tx.price),
-                "timestamp": tx.timestamp.isoformat(),
-                "wallet_tx_id": tx.wallet_transaction_id if tx.wallet_transaction else None,
-                "external_order_id": tx.external_order_id
-            } for tx in stock_txs]
-            
-            # Include basic info about all wallet transactions
-            response_data["diagnostics"]["wallet_transactions"] = [{
-                "id": tx.id,
-                "is_debit": tx.is_debit,
-                "amount": str(tx.amount),
-                "description": tx.description,
-                "timestamp": tx.timestamp.isoformat(),
-                "stock_id": tx.stock_id,
-                "stock_tx_id": tx.stock_transaction_id
-            } for tx in wallet_txs]
-            
-            # Check for missing and inconsistent links
-            stock_tx_issues = []
-            wallet_tx_issues = []
-            
-            for tx in stock_txs:
-                if tx.wallet_transaction is None:
-                    stock_tx_issues.append({
-                        "id": tx.id,
-                        "issue": "missing_wallet_link",
-                        "details": f"Stock transaction {tx.id} has no wallet transaction link"
-                    })
-            
-            for tx in wallet_txs:
-                if tx.stock_id and tx.stock_transaction_id is None:
-                    wallet_tx_issues.append({
-                        "id": tx.id,
-                        "issue": "missing_stock_link",
-                        "details": f"Wallet transaction {tx.id} has a stock ID but no stock transaction link"
-                    })
-                elif tx.stock_transaction_id:
-                    # Check if the stock transaction exists and belongs to this user
-                    try:
-                        stock_tx = StockTransaction.objects.get(id=tx.stock_transaction_id)
-                        if stock_tx.user_id != int(user_id):
-                            wallet_tx_issues.append({
-                                "id": tx.id,
-                                "issue": "cross_user_reference",
-                                "details": f"Wallet transaction {tx.id} references stock transaction {tx.stock_transaction_id} belonging to user {stock_tx.user_id}"
-                            })
-                    except StockTransaction.DoesNotExist:
-                        wallet_tx_issues.append({
-                            "id": tx.id,
-                            "issue": "invalid_stock_reference",
-                            "details": f"Wallet transaction {tx.id} references non-existent stock transaction {tx.stock_transaction_id}"
-                        })
-            
-            response_data["diagnostics"]["issues"] = {
-                "stock_transaction_issues": stock_tx_issues,
-                "wallet_transaction_issues": wallet_tx_issues
-            }
-            
-            # Add recommendations if issues found
-            if stock_tx_issues or wallet_tx_issues:
-                response_data["recommendations"].append(
-                    "Run fixTransactionLinks endpoint to resolve these issues"
-                )
-        
-        # If specific stock transaction ID provided, get detailed info
-        if stock_tx_id:
+            # Update user portfolio - deduct from holdings
             try:
-                stock_tx = StockTransaction.objects.get(id=stock_tx_id)
-                response_data["diagnostics"]["specific_stock_tx"] = {
-                    "id": stock_tx.id,
-                    "user_id": stock_tx.user_id,
-                    "stock_id": stock_tx.stock_id,
-                    "is_buy": stock_tx.is_buy,
-                    "status": stock_tx.status,
-                    "quantity": stock_tx.quantity,
-                    "price": str(stock_tx.price),
-                    "timestamp": stock_tx.timestamp.isoformat(),
-                    "wallet_tx_id": stock_tx.wallet_transaction_id if stock_tx.wallet_transaction else None,
-                    "external_order_id": stock_tx.external_order_id
-                }
+                portfolio = UserPortfolio.objects.get(user_id=user_id, stock=stock)
                 
-                # Check if there are wallet transactions referencing this stock transaction
-                wallet_references = WalletTransaction.objects.filter(stock_transaction_id=stock_tx_id)
-                if wallet_references.exists():
-                    response_data["diagnostics"]["specific_stock_tx"]["wallet_references"] = [{
-                        "id": tx.id,
-                        "user_id": tx.user_id,
-                        "is_debit": tx.is_debit,
-                        "amount": str(tx.amount),
-                        "description": tx.description,
-                        "timestamp": tx.timestamp.isoformat()
-                    } for tx in wallet_references]
-                    
-                    # If cross-user reference found
-                    for tx in wallet_references:
-                        if tx.user_id != stock_tx.user_id:
-                            response_data["recommendations"].append(
-                                f"Fix cross-user reference: Wallet TX {tx.id} (user {tx.user_id}) references Stock TX {stock_tx.id} (user {stock_tx.user_id})"
-                            )
-            except StockTransaction.DoesNotExist:
-                response_data["diagnostics"]["specific_stock_tx"] = {
-                    "error": f"Stock transaction with ID {stock_tx_id} does not exist"
-                }
-        
-        # If specific wallet transaction ID provided, get detailed info
-        if wallet_tx_id:
-            try:
-                wallet_tx = WalletTransaction.objects.get(id=wallet_tx_id)
-                response_data["diagnostics"]["specific_wallet_tx"] = {
-                    "id": wallet_tx.id,
-                    "user_id": wallet_tx.user_id,
-                    "is_debit": wallet_tx.is_debit,
-                    "amount": str(wallet_tx.amount),
-                    "description": wallet_tx.description,
-                    "timestamp": wallet_tx.timestamp.isoformat(),
-                    "stock_id": wallet_tx.stock_id,
-                    "stock_tx_id": wallet_tx.stock_transaction_id
-                }
+                # Check if user has enough shares
+                if portfolio.quantity < quantity:
+                    logger.warning(f"[TraceID: {trace_id}] User {user_id} has {portfolio.quantity} shares but trying to sell {quantity}")
                 
-                # If wallet transaction has a stock transaction reference
-                if wallet_tx.stock_transaction_id:
-                    try:
-                        stock_tx = StockTransaction.objects.get(id=wallet_tx.stock_transaction_id)
-                        response_data["diagnostics"]["specific_wallet_tx"]["referenced_stock_tx"] = {
-                            "id": stock_tx.id,
-                            "user_id": stock_tx.user_id,
-                            "stock_id": stock_tx.stock_id,
-                            "is_buy": stock_tx.is_buy,
-                            "status": stock_tx.status,
-                            "quantity": stock_tx.quantity,
-                            "price": str(stock_tx.price),
-                            "timestamp": stock_tx.timestamp.isoformat(),
-                            "wallet_tx_id": stock_tx.wallet_transaction_id if stock_tx.wallet_transaction else None
-                        }
-                        
-                        # If cross-user reference found
-                        if wallet_tx.user_id != stock_tx.user_id:
-                            response_data["recommendations"].append(
-                                f"Fix cross-user reference: Wallet TX {wallet_tx.id} (user {wallet_tx.user_id}) references Stock TX {stock_tx.id} (user {stock_tx.user_id})"
-                            )
-                            
-                            # Look for a better stock transaction match
-                            potential_matches = StockTransaction.objects.filter(
-                                user_id=wallet_tx.user_id,
-                                stock_id=stock_tx.stock_id,
-                                wallet_transaction__isnull=True
-                            ).order_by('timestamp')
-                            
-                            if potential_matches.exists():
-                                response_data["recommendations"].append(
-                                    f"Consider linking wallet transaction {wallet_tx.id} to stock transaction {potential_matches[0].id} (same user)"
-                                )
-                    except StockTransaction.DoesNotExist:
-                        response_data["diagnostics"]["specific_wallet_tx"]["referenced_stock_tx"] = {
-                            "error": f"Referenced stock transaction with ID {wallet_tx.stock_transaction_id} does not exist"
-                        }
-                        response_data["recommendations"].append(
-                            f"Fix invalid stock transaction reference in wallet transaction {wallet_tx.id}"
-                        )
-            except WalletTransaction.DoesNotExist:
-                response_data["diagnostics"]["specific_wallet_tx"] = {
-                    "error": f"Wallet transaction with ID {wallet_tx_id} does not exist"
-                }
+                # Update portfolio
+                portfolio.quantity = F('quantity') - quantity
+                portfolio.save()
+                portfolio.refresh_from_db()
+                
+                logger.info(f"[TraceID: {trace_id}] Updated portfolio for user {user_id}: removed {quantity} shares of {stock.symbol}, new total: {portfolio.quantity}")
+                
+                # If quantity is zero, optionally remove the portfolio entry
+                if portfolio.quantity <= 0:
+                    logger.info(f"[TraceID: {trace_id}] User {user_id} has no more shares of {stock.symbol}, removing portfolio entry")
+                    portfolio.delete()
+            except UserPortfolio.DoesNotExist:
+                logger.error(f"[TraceID: {trace_id}] User {user_id} has no portfolio for stock {stock.symbol} but is trying to sell")
         
-        return Response(response_data)
+        return wallet_tx
     
     except Exception as e:
-        logger.error(f"Error diagnosing transactions: {str(e)}")
+        logger.error(f"[TraceID: {trace_id}] Error processing stock transaction {stock_tx.id}: {str(e)}")
         logger.error(traceback.format_exc())
-        return Response(
-            {"success": False, "error": str(e)}, 
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+        raise
 
 # URL patterns (to be imported in urls.py)
 # These are the URL patterns to include in your urls.py file
@@ -2115,47 +1958,3 @@ urlpatterns = [
     path('api/setup/addStockToUser', add_stock_to_user, name='add_stock_to_user'),
 ]
 ''' 
-
-# Add this new utility function
-def ensure_consistent_transaction_links(stock_tx, wallet_tx):
-    """
-    Ensure consistent bidirectional links between stock transaction and wallet transaction.
-    This utility function guarantees that both transactions point to each other correctly.
-    
-    Args:
-        stock_tx: The StockTransaction object
-        wallet_tx: The WalletTransaction object
-    
-    Returns:
-        tuple: (stock_tx, wallet_tx) with consistent links established
-    """
-    # Log what we're trying to do for debugging
-    logger.debug(f"Ensuring consistent bidirectional links between stock TX {stock_tx.id} and wallet TX {wallet_tx.id}")
-    
-    # Check if current links are already consistent
-    current_stock_wallet_id = stock_tx.wallet_transaction_id if stock_tx.wallet_transaction else None
-    current_wallet_stock_id = wallet_tx.stock_transaction_id
-    
-    if current_stock_wallet_id == wallet_tx.id and current_wallet_stock_id == stock_tx.id:
-        logger.debug(f"Links already consistent between stock TX {stock_tx.id} and wallet TX {wallet_tx.id}")
-        return stock_tx, wallet_tx
-    
-    # Log inconsistencies if any
-    if current_stock_wallet_id != wallet_tx.id:
-        logger.info(f"Fixing stock TX {stock_tx.id} wallet link: current={current_stock_wallet_id}, should be={wallet_tx.id}")
-    
-    if current_wallet_stock_id != stock_tx.id:
-        logger.info(f"Fixing wallet TX {wallet_tx.id} stock link: current={current_wallet_stock_id}, should be={stock_tx.id}")
-    
-    # Update the stock transaction to point to the wallet transaction
-    stock_tx.wallet_transaction = wallet_tx
-    stock_tx.save(update_fields=['wallet_transaction'])
-    
-    # Update the wallet transaction to point to the stock transaction
-    wallet_tx.stock_transaction = stock_tx
-    wallet_tx.stock_transaction_id = stock_tx.id  # Explicitly set ID for consistency
-    wallet_tx.save(update_fields=['stock_transaction', 'stock_transaction_id'])
-    
-    logger.info(f"Successfully established bidirectional link between stock TX {stock_tx.id} and wallet TX {wallet_tx.id}")
-    
-    return stock_tx, wallet_tx

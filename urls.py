@@ -12,8 +12,6 @@ from views import (
     # place_stock_order,
     process_order_status,
     update_stock_prices,
-    fix_transaction_links,
-    diagnose_transactions
 )
 
 # Add a debug view to help troubleshoot
@@ -240,9 +238,6 @@ urlpatterns = [
     path('api/transaction/processOrderStatus', process_order_status, name='process_order_status'),
     path('api/transaction/processOrderStatus/', process_order_status, name='process_order_status_slash'),
     
-    # Add transaction fix endpoint to transaction API section
-    path('api/transaction/fixTransactionLinks', fix_transaction_links, name='fix_transaction_links_transaction'),
-    path('api/transaction/fixTransactionLinks/', fix_transaction_links, name='fix_transaction_links_transaction_slash'),
     
     # Setup endpoints
     path('api/setup/createStock', create_stock, name='create_stock'),
@@ -252,11 +247,6 @@ urlpatterns = [
     # Debug endpoints - no authentication required
     path('api/debug/auth', debug_auth, name='debug_auth'),
     
-    # Maintenance endpoints
-    path('api/maintenance/fixTransactionLinks', fix_transaction_links, name='fix_transaction_links'),
-    path('api/maintenance/fixTransactionLinks/', fix_transaction_links, name='fix_transaction_links_slash'),
-    path('api/maintenance/diagnoseTransactions', diagnose_transactions, name='diagnose_transactions'),
-    path('api/maintenance/diagnoseTransactions/', diagnose_transactions, name='diagnose_transactions_slash'),
     
     # Alternative paths (with trailing slashes) for Django handling
     path('api/transaction/getStockPrices/', get_stock_prices, name='get_stock_prices_slash'),

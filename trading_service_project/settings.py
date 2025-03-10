@@ -87,10 +87,12 @@ WSGI_APPLICATION = 'trading_service_project.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
-        'NAME': os.getenv('DB_NAME', 'db_daytrading_trading_service'),
+        'NAME': os.getenv('DB_NAME', 'trading_db'),
         'USER': os.getenv('DB_USER', 'postgres'),
         'PASSWORD': os.getenv('DB_PASSWORD', 'osalocal_database'),
-        'HOST': os.getenv('DB_HOST', 'localhost'),
+        # 'HOST': os.getenv('DB_HOST', 'localhost'),
+        'HOST': os.getenv('DB_HOST', 'db'),
+        # 'PORT': os.getenv('DB_PORT', '5432'),
         'PORT': os.getenv('DB_PORT', '5432'),
     }
 }
