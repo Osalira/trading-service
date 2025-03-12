@@ -7,6 +7,7 @@ import logging
 import os
 import traceback
 import socket
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,9 @@ TRUSTED_SERVICES = [
     'matching-engine',
     'api-gateway'
 ]
+
+# Default to system user UUID for testing instead of numeric ID
+SYSTEM_USER_ID = str(uuid.uuid4())
 
 # When run in docker, the hostname will resolve to the container IP
 def is_request_from_trusted_service(request):
@@ -99,7 +103,7 @@ class CustomJWTAuthentication(BaseAuthentication):
             
             # Default to system user only if no user_id was found anywhere
             if user_id is None:
-                user_id = '999'
+                user_id = SYSTEM_USER_ID
                 logger.warning(f"No user_id found in request, defaulting to system user: {user_id}")
             
             # Ensure user_id is treated as integer/string consistently
@@ -108,7 +112,7 @@ class CustomJWTAuthentication(BaseAuthentication):
                 logger.debug(f"Final user_id for authentication: {user_id}")
             except Exception as e:
                 logger.error(f"Error converting user_id: {str(e)}")
-                user_id = '999'  # Fallback to system user
+                user_id = SYSTEM_USER_ID  # Fallback to system user
             
             # Create a minimal user_info dict with just the ID
             user_info = {'id': user_id}

@@ -16,7 +16,7 @@ class PriceField(serializers.DecimalField):
             return None
             
         # Convert to string with decimal places
-        decimal_str = super().to_representation(value)
+        decimal_str = str(value)
         
         # If it's a whole number, remove the decimal part
         if '.' in decimal_str:
@@ -189,10 +189,15 @@ class WalletTransactionSerializer(serializers.ModelSerializer):
     stock_transaction_id = serializers.SerializerMethodField()
     amount = PriceField(max_digits=12, decimal_places=2)
     
+    # Add wallet_tx_id and stock_tx_id fields
+    wallet_tx_id = serializers.IntegerField(source='id', read_only=True)
+    stock_tx_id = serializers.SerializerMethodField()
+    
     class Meta:
         model = WalletTransaction
         fields = [
-            'id', 'user_id', 'stock', 'stock_symbol', 'stock_transaction_id',
+            'id', 'wallet_tx_id', 'user_id', 'stock', 'stock_symbol', 'stock_tx_id',
+            'stock_transaction_id',
             'is_debit', 'amount', 'description', 'timestamp'
         ]
         read_only_fields = ['id', 'timestamp']
@@ -204,6 +209,10 @@ class WalletTransactionSerializer(serializers.ModelSerializer):
         elif hasattr(obj, 'related_stock_tx') and obj.related_stock_tx:
             return obj.related_stock_tx.id
         return None
+
+    def get_stock_tx_id(self, obj):
+        """Get the stock transaction ID from the relationship"""
+        return self.get_stock_transaction_id(obj)
 
 # JMeter specific wallet transaction serializer
 class JMeterWalletTransactionSerializer(serializers.ModelSerializer):

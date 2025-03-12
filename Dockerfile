@@ -35,12 +35,11 @@ RUN mkdir -p staticfiles logs
 # Create a non-root user
 RUN adduser --disabled-password --gecos '' appuser
 
-# Remove the entrypoint script file - we'll use inline commands instead
-# RUN chmod +x /app/docker-entrypoint.sh && \
-#     dos2unix /app/docker-entrypoint.sh && \
-#     echo "Entrypoint script permissions: $(ls -la /app/docker-entrypoint.sh)" && \
-#     echo "Build timestamp: $(date)" && \
-#     cat /app/docker-entrypoint.sh | head -n 3
+# Ensure entrypoint script is executable
+RUN chmod +x /app/entrypoint.sh && \
+    dos2unix /app/entrypoint.sh && \
+    echo "Entrypoint script permissions: $(ls -la /app/entrypoint.sh)" && \
+    echo "Build timestamp: $(date)"
 
 RUN chown -R appuser:appuser /app
 
@@ -50,12 +49,5 @@ USER appuser
 # Expose the port the app runs on
 EXPOSE 8000
 
-# Replace ENTRYPOINT with CMD that includes the script functionality directly
-# This avoids the need for a separate shell script file
-CMD bash -c "echo 'Waiting for database...' && \
-             while ! nc -z \$DB_HOST \$DB_PORT; do sleep 1; done && \
-             echo 'Database is ready!' && \
-             echo 'Applying database migrations...' && \
-             python manage.py migrate && \
-             echo 'Starting Gunicorn...' && \
-             gunicorn --bind 0.0.0.0:8000 --workers 4 --threads 2 trading_service_project.wsgi:application"
+# Use our entrypoint script
+ENTRYPOINT ["/app/entrypoint.sh"]

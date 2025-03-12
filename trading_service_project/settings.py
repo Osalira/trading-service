@@ -1,6 +1,9 @@
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+import threading
+import time
+from django.db import connections
 
 # Load environment variables
 load_dotenv()
@@ -90,12 +93,40 @@ DATABASES = {
         'NAME': os.getenv('DB_NAME', 'trading_db'),
         'USER': os.getenv('DB_USER', 'user'),
         'PASSWORD': os.getenv('DB_PASSWORD', 'password'),
-        # 'HOST': os.getenv('DB_HOST', 'localhost'),
         'HOST': os.getenv('DB_HOST', 'db'),
-        # 'PORT': os.getenv('DB_PORT', '5432'),
         'PORT': os.getenv('DB_PORT', '5432'),
+        # Connection pooling optimization
+        'CONN_MAX_AGE': int(os.getenv('DB_CONN_MAX_AGE', 160)),  # Keep connections alive
+        'CONN_HEALTH_CHECKS': True,  # Check connection health before reuse
+        'OPTIONS': {
+            'connect_timeout': int(os.getenv('DB_CONNECT_TIMEOUT', 10)),
+            'keepalives': 1,
+            'keepalives_idle': 60,
+            'keepalives_interval': 10,
+            'keepalives_count': 5,
+        },
+        'ATOMIC_REQUESTS': False,  # We'll manage transactions explicitly
+        'AUTOCOMMIT': True,  # Default Django behavior
     }
 }
+
+# Implement proper Redis cache for better performance
+CACHES = {
+    'default': {
+        'BACKEND': 'django_redis.cache.RedisCache',
+        'LOCATION': f"redis://{os.getenv('REDIS_HOST', 'redis')}:{os.getenv('REDIS_PORT', '6379')}/1",
+        'OPTIONS': {
+            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+            'SOCKET_CONNECT_TIMEOUT': 5,
+            'SOCKET_TIMEOUT': 5,
+            'CONNECTION_POOL_KWARGS': {'max_connections': 100},
+            'COMPRESSOR': 'django_redis.compressors.zlib.ZlibCompressor',
+        },
+        'KEY_PREFIX': 'trading_',
+        'TIMEOUT': 1,  # Default cache timeout in seconds
+    }
+}
+
 
 # Password validation
 # https://docs.djangoproject.com/en/4.2/ref/settings/#auth-password-validators
@@ -160,6 +191,9 @@ REST_FRAMEWORK = {
     'EXCEPTION_HANDLER': 'rest_framework.views.exception_handler',
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 10,
+    # Add custom JSON encoder to handle Decimal values
+    'COERCE_DECIMAL_TO_STRING': False,  # Don't convert decimals to strings
+    'JSON_ENCODER': 'trading_service_project.utils.CustomJSONEncoder',
 }
 
 # JWT configuration
@@ -210,4 +244,11 @@ LOGGING = {
             'propagate': False,
         },
     },
-} 
+}
+
+# # Very simple cache configuration
+# CACHES = {
+#     'default': {
+#         'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+#     }
+# } 
