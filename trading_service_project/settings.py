@@ -123,7 +123,7 @@ CACHES = {
             'COMPRESSOR': 'django_redis.compressors.zlib.ZlibCompressor',
         },
         'KEY_PREFIX': 'trading_',
-        'TIMEOUT': 1,  # Default cache timeout in seconds
+        'TIMEOUT': 0,  # Set timeout to 0 to disable caching completely for load testing
     }
 }
 

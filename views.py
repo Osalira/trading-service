@@ -111,21 +111,10 @@ def format_decimal(value):
 def get_stock_prices(request):
     """Get a list of all stocks with their current prices"""
     try:
-        # Try to get cached stock prices first
-        cache_key = 'all_stock_prices'
-        cached_data = cache.get(cache_key)
-        
-        if cached_data:
-            logger.debug("Returning cached stock prices")
-            return Response({"success": True, "data": cached_data, "cached": True})
-            
-        # Cache miss - fetch from database
+        # For load testing, bypass caching and always fetch from database
         start_time = time.time()
         stocks = Stock.objects.all().order_by('-company_name')
         serializer = StockPriceSerializer(stocks, many=True)
-        
-        # Cache the result for 5 seconds (adjustable based on update frequency)
-        cache.set(cache_key, serializer.data, 5)
         
         execution_time = time.time() - start_time
         logger.debug(f"Fetched stock prices from DB in {execution_time:.3f}s")
